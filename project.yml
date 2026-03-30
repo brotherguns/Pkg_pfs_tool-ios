@@ -16,7 +16,7 @@ x-c-flags: &c_flags >-
   -Wno-everything
   -include $(PROJECT_DIR)/darwin_compat.h
   -I$(PROJECT_DIR)/pkg_pfs_tool/src
-  -I$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include
+  -I$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include -I$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include/uthash
   -I$(PROJECT_DIR)/PKGExtractor/Bridge
 
 targets:
@@ -44,6 +44,7 @@ targets:
         HEADER_SEARCH_PATHS:
           - "$(PROJECT_DIR)/pkg_pfs_tool/src"
           - "$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include"
+          - "$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include/uthash"
           - "$(PROJECT_DIR)/PKGExtractor/Bridge"
         OTHER_LDFLAGS:
           - "-lmbedcrypto"
