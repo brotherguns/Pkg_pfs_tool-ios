@@ -1,0 +1,13 @@
+# Xcode
+*.xcodeproj/
+*.xcworkspace/
+xcuserdata/
+DerivedData/
+
+# Build artifacts
+build/
+mbedtls-src/
+mbedtls-ios/
+
+# macOS
+.DS_Store

@@ -1,0 +1,78 @@
+name: Build Unsigned IPA
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Select Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Build mbedtls for iOS arm64
+        run: |
+          git clone --depth 1 --branch v3.6.1 https://github.com/Mbed-TLS/mbedtls.git mbedtls-src
+          cd mbedtls-src
+          mkdir build-ios && cd build-ios
+          IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
+          cmake .. \
+            -DCMAKE_SYSTEM_NAME=iOS \
+            -DCMAKE_OSX_ARCHITECTURES=arm64 \
+            -DCMAKE_OSX_SYSROOT="$IOS_SDK" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=15.0 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_TESTING=OFF \
+            -DENABLE_PROGRAMS=OFF \
+            -DMBEDTLS_FATAL_WARNINGS=OFF
+          make -j$(sysctl -n hw.logicalcpu) mbedcrypto mbedtls mbedx509
+          mkdir -p ../../mbedtls-ios/lib ../../mbedtls-ios/include
+          cp library/libmbedcrypto.a library/libmbedtls.a library/libmbedx509.a \
+             ../../mbedtls-ios/lib/
+          cp -r ../include/mbedtls ../../mbedtls-ios/include/
+          cp -r ../include/psa    ../../mbedtls-ios/include/
+          echo "✅ mbedtls built for iOS arm64"
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec project.yml
+
+      - name: Build (unsigned)
+        run: |
+          xcodebuild \
+            -project PKGExtractor.xcodeproj \
+            -scheme PKGExtractor \
+            -configuration Release \
+            -sdk iphoneos \
+            -arch arm64 \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            EXPANDED_CODE_SIGN_IDENTITY="" \
+            CONFIGURATION_BUILD_DIR="$(pwd)/build/Release-iphoneos" \
+            build 2>&1 | xcpretty || true
+          # Verify the .app was created
+          ls build/Release-iphoneos/PKGExtractor.app
+
+      - name: Package IPA
+        run: |
+          mkdir -p build/Payload
+          cp -r build/Release-iphoneos/PKGExtractor.app build/Payload/
+          cd build
+          zip -r PKGExtractor-unsigned.ipa Payload/
+          echo "📦 IPA size: $(du -sh PKGExtractor-unsigned.ipa | cut -f1)"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PKGExtractor-unsigned
+          path: build/PKGExtractor-unsigned.ipa
+          retention-days: 30
