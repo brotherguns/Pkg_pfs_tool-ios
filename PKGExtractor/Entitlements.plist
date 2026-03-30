@@ -2,10 +2,13 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>application-identifier</key>
-    <string>$(AppIdentifierPrefix)com.brotherguns.pkgextractor</string>
-    <key>com.apple.developer.team-identifier</key>
-    <string>$(AppIdentifierPrefix)</string>
+    <!--
+        Minimal entitlements for an unsigned sideloaded build.
+        $(AppIdentifierPrefix) is an Xcode build variable that only expands
+        during a real signed build — leaving it literal breaks FeatherSign.
+        FeatherSign (and AltStore/Sideloadly) inject application-identifier
+        and com.apple.developer.team-identifier from your cert automatically.
+    -->
     <key>get-task-allow</key>
     <true/>
 </dict>
