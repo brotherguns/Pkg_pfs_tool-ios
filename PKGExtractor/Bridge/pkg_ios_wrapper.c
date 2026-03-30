@@ -2,6 +2,14 @@
  * pkg_ios_wrapper.c
  *
  * Bridges pkg_pfs_tool's C library to the iOS Swift layer.
+ *
+ * Key design decisions:
+ *  - PKG_FLAGS_SIGNED_EKPFS is set on BOTH retail AND fake-signed pkgs.
+ *    We do NOT use it to block extraction — let the C library try all keys.
+ *  - For fpkgs created with all-zero passcode, we inject a per-content-ID
+ *    passcode=000...000 entry into a temporary config so keymgr picks it up.
+ *  - error() in util_ios.c calls pkg_ios_abort() which longjmps back here
+ *    instead of calling exit(), so the app doesn't crash.
  */
 
 #include "pkg_ios_wrapper.h"
@@ -65,12 +73,12 @@ static void set_error(const char* msg) {
     pthread_once(&s_once, make_key);
     char* buf = (char*)pthread_getspecific(s_err_key);
     if (!buf) {
-        buf = (char*)malloc(2048);
+        buf = (char*)malloc(4096);
         if (!buf) return;
         pthread_setspecific(s_err_key, buf);
     }
-    strncpy(buf, msg, 2047);
-    buf[2047] = '\0';
+    strncpy(buf, msg, 4095);
+    buf[4095] = '\0';
 }
 
 static void append_warn_log_to_error(void) {
@@ -79,10 +87,10 @@ static void append_warn_log_to_error(void) {
     char* buf = (char*)pthread_getspecific(s_err_key);
     if (!buf) return;
     size_t cur = strlen(buf);
-    size_t rem = 2047 - cur;
+    size_t rem = 4095 - cur;
     if (rem < 10) return;
     strncat(buf, "\n\nDetails:\n", rem);
-    rem = 2047 - strlen(buf);
+    rem = 4095 - strlen(buf);
     strncat(buf, g_pkg_warn_log, rem);
 }
 
@@ -141,70 +149,98 @@ static void mkdir_p(const char* path) {
 }
 
 /* ------------------------------------------------------------------ */
-/* PKG header inspection                                              */
+/* Read content_id from PKG header (offset 0x40, up to 48 bytes)     */
 /* ------------------------------------------------------------------ */
 
-/* PS4 PKG magic: \x7f C N T */
-static const uint8_t PKG_MAGIC[4] = { 0x7f, 0x43, 0x4e, 0x54 };
-
-#define PKG_FLAGS_OFFSET       0x04   /* uint32_t, big-endian */
+#define PKG_MAGIC_0  0x7f
+#define PKG_MAGIC_1  0x43   /* 'C' */
+#define PKG_MAGIC_2  0x4e   /* 'N' */
+#define PKG_MAGIC_3  0x54   /* 'T' */
 #define PKG_CONTENT_ID_OFFSET  0x40
 #define PKG_CONTENT_ID_SIZE    0x30
 
-/* Bit 25 set = EKPFS is RSA-signed with retail_ekpfs_key (private, console-derived).
-   Bit 25 clear = EKPFS is encrypted with debug_ekpfs_key or fake_ekpfs_key. */
-#define PKG_FLAGS_SIGNED_EKPFS (1u << 25)
-#define PKG_FLAGS_FINALIZED    (1u << 31)
-
-typedef struct {
-    int    valid;           /* 0 if open/read failed */
-    int    is_retail;       /* 1 if PKG_FLAGS_SIGNED_EKPFS is set */
-    int    is_finalized;    /* 1 if PKG_FLAGS_FINALIZED is set */
-    uint32_t flags;
-    char   content_id[PKG_CONTENT_ID_SIZE + 4];
-} pkg_header_info_t;
-
-static pkg_header_info_t read_pkg_header(const char* pkg_path) {
-    pkg_header_info_t info;
-    memset(&info, 0, sizeof(info));
-
+static int read_content_id(const char* pkg_path, char* out_id, size_t out_size) {
     FILE* f = fopen(pkg_path, "rb");
-    if (!f) return info;
+    if (!f) return 0;
 
-    /* Check magic */
     uint8_t magic[4] = { 0 };
-    if (fread(magic, 1, 4, f) != 4 || memcmp(magic, PKG_MAGIC, 4) != 0) {
+    if (fread(magic, 1, 4, f) != 4 ||
+        magic[0] != PKG_MAGIC_0 || magic[1] != PKG_MAGIC_1 ||
+        magic[2] != PKG_MAGIC_2 || magic[3] != PKG_MAGIC_3) {
         fclose(f);
-        return info;
+        return 0;
     }
 
-    /* Read flags (big-endian uint32 at 0x04) */
-    uint8_t flags_buf[4] = { 0 };
-    if (fread(flags_buf, 1, 4, f) == 4) {
-        info.flags = ((uint32_t)flags_buf[0] << 24) |
-                     ((uint32_t)flags_buf[1] << 16) |
-                     ((uint32_t)flags_buf[2] <<  8) |
-                     ((uint32_t)flags_buf[3]);
-        info.is_retail    = (info.flags & PKG_FLAGS_SIGNED_EKPFS) != 0;
-        info.is_finalized = (info.flags & PKG_FLAGS_FINALIZED) != 0;
-    }
+    if (fseek(f, PKG_CONTENT_ID_OFFSET, SEEK_SET) != 0) { fclose(f); return 0; }
 
-    /* Read content_id */
-    if (fseek(f, PKG_CONTENT_ID_OFFSET, SEEK_SET) == 0) {
-        size_t n = fread(info.content_id, 1, PKG_CONTENT_ID_SIZE, f);
-        info.content_id[n < PKG_CONTENT_ID_SIZE ? n : PKG_CONTENT_ID_SIZE] = '\0';
-        for (size_t i = 0; i < n; i++) {
-            if ((unsigned char)info.content_id[i] < 0x20 ||
-                (unsigned char)info.content_id[i] > 0x7E) {
-                info.content_id[i] = '\0';
-                break;
-            }
+    size_t to_read = (out_size - 1 < PKG_CONTENT_ID_SIZE) ? out_size - 1 : PKG_CONTENT_ID_SIZE;
+    size_t n = fread(out_id, 1, to_read, f);
+    fclose(f);
+
+    out_id[n] = '\0';
+    /* sanitize: truncate at first non-printable byte */
+    for (size_t i = 0; i < n; i++) {
+        if ((unsigned char)out_id[i] < 0x20 || (unsigned char)out_id[i] > 0x7E) {
+            out_id[i] = '\0';
+            break;
         }
     }
+    return out_id[0] != '\0';
+}
 
-    fclose(f);
-    info.valid = 1;
-    return info;
+/* ------------------------------------------------------------------ */
+/* Build a merged config: original config.ini + zero-passcode entry  */
+/* for this PKG's content_id.                                         */
+/*                                                                    */
+/* Why: fpkgs (fake-signed packages) are typically created with an   */
+/* all-zero passcode. keymgr_generate_keys_for_title_keyset checks   */
+/* a per-title passcode entry BEFORE trying the EKPFS RSA path, so   */
+/* injecting passcode=000...0 directly bypasses the RSA step and     */
+/* derives the correct key from content_id + zero passcode.          */
+/* ------------------------------------------------------------------ */
+
+static char s_tmp_config_path[4096];
+
+static const char* make_temp_config(const char* base_config_path,
+                                    const char* content_id) {
+    /* Write to a temp file in the same directory as base_config */
+    snprintf(s_tmp_config_path, sizeof(s_tmp_config_path),
+             "%s.tmp_pkg_ios", base_config_path);
+
+    /* Read original config */
+    FILE* src = fopen(base_config_path, "rb");
+    if (!src) return base_config_path;   /* fallback: use original */
+
+    fseek(src, 0, SEEK_END);
+    long src_size = ftell(src);
+    rewind(src);
+    if (src_size <= 0) { fclose(src); return base_config_path; }
+
+    char* buf = (char*)malloc((size_t)src_size + 1);
+    if (!buf) { fclose(src); return base_config_path; }
+    size_t n = fread(buf, 1, (size_t)src_size, src);
+    fclose(src);
+    buf[n] = '\0';
+
+    /* Check if content_id section already exists */
+    int already_present = (strstr(buf, content_id) != NULL);
+
+    FILE* dst = fopen(s_tmp_config_path, "wb");
+    if (!dst) { free(buf); return base_config_path; }
+
+    fwrite(buf, 1, n, dst);
+    free(buf);
+
+    /* Append the zero-passcode section if not already there */
+    if (!already_present && content_id[0] != '\0') {
+        fprintf(dst,
+                "\n[%s]\n"
+                "passcode=00000000000000000000000000000000\n",
+                content_id);
+    }
+
+    fclose(dst);
+    return s_tmp_config_path;
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,51 +266,12 @@ int pkg_ios_extract(
     /* Reset warning log */
     g_pkg_warn_log[0] = '\0';
 
-    /* --- Step 1: Read and validate PKG header --- */
-    pkg_header_info_t hdr = read_pkg_header(pkg_path);
+    /* --- Step 1: Read content_id and build merged config --- */
+    char content_id[PKG_CONTENT_ID_SIZE + 4] = { 0 };
+    read_content_id(pkg_path, content_id, sizeof(content_id));
 
-    if (!hdr.valid) {
-        char errbuf[512];
-        snprintf(errbuf, sizeof(errbuf),
-                 "Cannot open or parse PKG file.\n"
-                 "Path: %s\nErrno: %s",
-                 pkg_path, strerror(errno));
-        set_error(errbuf);
-        return -1;
-    }
+    const char* effective_config = make_temp_config(config_path, content_id);
 
-    if (hdr.is_retail) {
-        /*
-         * PKG_FLAGS_SIGNED_EKPFS is set — this is a RETAIL PKG.
-         * The EKPFS blob is RSA-encrypted with retail_ekpfs_key, which is a
-         * console-specific private key NOT included in any public config.ini.
-         * fake_ekpfs_key and debug_ekpfs_key cannot decrypt it.
-         *
-         * To extract this PKG you need the per-title PASSCODE from the
-         * license/RIF file on your PS4 (requires a jailbroken PS4 to dump).
-         * Add it to config.ini:
-         *
-         *   [%s]
-         *   passcode=<32-hex-char passcode from your PS4 RIF>
-         */
-        char errbuf[2048];
-        snprintf(errbuf, sizeof(errbuf),
-                 "This is a RETAIL PKG (PKG_FLAGS_SIGNED_EKPFS is set).\n"
-                 "Content ID: %s\n\n"
-                 "Retail PKGs use a console-specific RSA key to protect\n"
-                 "the EKPFS blob. fake_ekpfs_key / debug_ekpfs_key cannot\n"
-                 "decrypt it.\n\n"
-                 "You need the per-title passcode from the license/RIF\n"
-                 "file on your jailbroken PS4. Add it to config.ini:\n\n"
-                 "  [%s]\n"
-                 "  passcode=<32-hex chars from RIF>",
-                 hdr.content_id[0] ? hdr.content_id : "(unknown)",
-                 hdr.content_id[0] ? hdr.content_id : "CONTENT_ID_HERE");
-        set_error(errbuf);
-        return -1;
-    }
-
-    /* PKG is debug/fake-signed — fake_ekpfs_key or debug_ekpfs_key should work */
     mkdir_p(output_dir);
 
     /* --- Step 2: Arm longjmp so error() doesn't exit() --- */
@@ -294,9 +291,10 @@ int pkg_ios_extract(
     }
 
     /* --- Step 3: Load keys --- */
-    if (!keymgr_initialize(config_path)) {
+    if (!keymgr_initialize(effective_config)) {
         set_error("keymgr_initialize failed.\n"
-                  "config.ini may be missing required global keys.");
+                  "config.ini may be missing required global keys\n"
+                  "(fake_ekpfs_key, debug_ekpfs_key, sealed_key_enc_key_*, etc.)");
         append_warn_log_to_error();
         goto done;
     }
@@ -306,13 +304,16 @@ int pkg_ios_extract(
     if (!pkg) {
         char errbuf[2048];
         snprintf(errbuf, sizeof(errbuf),
-                 "pkg_alloc failed for: %s\n\n"
-                 "PKG flags: 0x%08X  (fake/debug-signed, not retail)\n\n"
-                 "fake_ekpfs_key / debug_ekpfs_key in config.ini could not\n"
-                 "decrypt this PKG's EKPFS. This usually means the PKG was\n"
-                 "signed with a different key than what's in config.ini.",
-                 hdr.content_id[0] ? hdr.content_id : "(unknown)",
-                 hdr.flags);
+                 "pkg_alloc failed.\n"
+                 "Content ID: %s\n\n"
+                 "Possible causes:\n"
+                 "  1. PKG is corrupt or not a valid PS4 PKG\n"
+                 "  2. The PKG's passcode is NOT all zeros\n"
+                 "     (try entering the correct 32-char hex passcode)\n"
+                 "  3. fake_ekpfs_key in config.ini is wrong or missing\n"
+                 "  4. This is a retail PKG (needs per-title passcode from\n"
+                 "     your PS4's RIF/license file)",
+                 content_id[0] ? content_id : "(could not read)");
         set_error(errbuf);
         append_warn_log_to_error();
         goto done;
@@ -320,7 +321,7 @@ int pkg_ios_extract(
 
     if (!pkg->inner_pfs) {
         set_error("PKG has no inner PFS image.\n"
-                  "This PKG type may not be supported (patch or DLC-only PKG).");
+                  "This PKG type may not be supported (e.g. DLC-only or patch PKG).");
         goto done;
     }
 
@@ -334,7 +335,7 @@ int pkg_ios_extract(
     mkdir_p(image0);
 
     if (!pfs_unpack_all(pkg->inner_pfs, image0, ios_unpack_pre_cb, &ctx)) {
-        set_error("pfs_unpack_all failed — PKG may be corrupt.");
+        set_error("pfs_unpack_all failed — PKG may be corrupt or key derivation failed.");
         append_warn_log_to_error();
         goto done;
     }
