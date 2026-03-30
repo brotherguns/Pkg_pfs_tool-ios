@@ -34,7 +34,8 @@ jobs:
             -DENABLE_TESTING=OFF \
             -DENABLE_PROGRAMS=OFF \
             -DMBEDTLS_FATAL_WARNINGS=OFF \
-            -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+            -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+            -DCMAKE_C_FLAGS="-DMBEDTLS_CMAC_C"
           make -j$(sysctl -n hw.logicalcpu) mbedcrypto mbedtls mbedx509
           mkdir -p ../../mbedtls-ios/lib
           cp library/libmbedcrypto.a library/libmbedtls.a library/libmbedx509.a \
