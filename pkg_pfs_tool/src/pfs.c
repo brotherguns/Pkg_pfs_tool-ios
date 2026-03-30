@@ -80,6 +80,9 @@ struct pfs* pfs_alloc(struct pfs_io_callbacks* io, const struct pfs_options* opt
 #endif
 	uint8_t image_key[KEYMGR_HASH_SIZE];
 	char image_key_str[KEYMGR_HASH_SIZE * 2 + 1];
+	/* Diagnostic hex buffers for verbose header-hash mismatch reporting */
+	char diag_computed_hex[PFS_HASH_SIZE * 2 + 1];
+	char diag_expected_hex[PFS_HASH_SIZE * 2 + 1];
 	int has_auth_code;
 	size_t i;
 	int status = 0;
@@ -177,6 +180,13 @@ gen_keys_failed:
 
 			pfs_sign_buffer(pfs, header_data, PFS_HEADER_SIZE, hash);
 			if (memcmp(hash, pfs->hdr.header_hash, sizeof(hash)) != 0) {
+				/* algo_variant=0 failed — log before retrying with variant=1 */
+				snprintf_hex(diag_computed_hex, sizeof(diag_computed_hex), hash, PFS_HASH_SIZE);
+				snprintf_hex(diag_expected_hex, sizeof(diag_expected_hex), pfs->hdr.header_hash, PFS_HASH_SIZE);
+				warning("Header hash mismatch (algo_variant=0) — retrying with algo_variant=1.\n"
+				        "  Computed : %.32s\n"
+				        "  Expected : %.32s",
+				        diag_computed_hex, diag_expected_hex);
 #if defined(ENABLE_SD_KEYGEN)
 				if (!pfs->opts->is_sd) {
 #endif
@@ -187,7 +197,14 @@ gen_keys_failed:
 					pfs_sign_buffer(pfs, header_data, PFS_HEADER_SIZE, hash);
 					if (memcmp(hash, pfs->hdr.header_hash, sizeof(hash)) != 0) {
 invalid_header_hash:
-						warning("Invalid header hash.");
+						snprintf_hex(diag_computed_hex, sizeof(diag_computed_hex), hash, PFS_HASH_SIZE);
+						snprintf_hex(diag_expected_hex, sizeof(diag_expected_hex), pfs->hdr.header_hash, PFS_HASH_SIZE);
+						warning("Invalid header hash — both algo variants failed.\n"
+						        "  Computed : %.32s\n"
+						        "  Expected : %.32s\n"
+						        "  Likely cause: fake_ekpfs_key or debug_ekpfs_key in config.ini\n"
+						        "  is wrong, truncated, or missing.",
+						        diag_computed_hex, diag_expected_hex);
 						goto error;
 					}
 #if defined(ENABLE_SD_KEYGEN)
