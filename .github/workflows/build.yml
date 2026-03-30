@@ -21,10 +21,6 @@ jobs:
 
       - name: Build mbedtls for iOS arm64
         run: |
-          # ⚠️  MUST use 2.x — the vendored headers in thirdparty/include are mbedtls 2.24.0.
-          # Linking a 3.x library against 2.x headers causes ABI mismatch and linker failure.
-          # 2.28.9 is the last 2.x LTS release and is API-compatible with 2.24.0.
-          # 2.x has NO git submodules — do NOT use --recurse-submodules.
           git clone --depth 1 --branch v2.28.9 https://github.com/Mbed-TLS/mbedtls.git mbedtls-src
           cd mbedtls-src
           mkdir build-ios && cd build-ios
@@ -43,17 +39,15 @@ jobs:
           mkdir -p ../../mbedtls-ios/lib
           cp library/libmbedcrypto.a library/libmbedtls.a library/libmbedx509.a \
              ../../mbedtls-ios/lib/
-          echo "✅ mbedtls 2.28.9 built for iOS arm64"
-          echo "   libs: $(ls -lh ../../mbedtls-ios/lib/)"
+          echo "mbedtls 2.28.9 built for iOS arm64"
+          ls -lh ../../mbedtls-ios/lib/
 
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
       - name: Build (unsigned)
         run: |
-          # set -o pipefail makes the pipe fail if xcodebuild fails,
-          # even when piped through xcpretty.
-          set -o pipefail
+          # No xcpretty — raw output so every error is visible in the Actions log.
           xcodebuild \
             -project PKGExtractor.xcodeproj \
             -scheme PKGExtractor \
@@ -65,16 +59,14 @@ jobs:
             DEVELOPMENT_TEAM="" \
             EXPANDED_CODE_SIGN_IDENTITY="" \
             CONFIGURATION_BUILD_DIR="$(pwd)/build/Release-iphoneos" \
-            build 2>&1 | xcpretty
+            build
 
-          # Verify the executable binary exists — not just the .app directory.
-          # The directory is created even on failed builds; the binary is not.
           BINARY="build/Release-iphoneos/PKGExtractor.app/PKGExtractor"
           if [ ! -f "$BINARY" ]; then
-            echo "❌ Build failed: executable not found at $BINARY"
+            echo "Build failed: executable not found at $BINARY"
             exit 1
           fi
-          echo "✅ Binary present: $(ls -lh $BINARY)"
+          echo "Binary OK: $(ls -lh $BINARY)"
 
       - name: Package IPA
         run: |
@@ -82,7 +74,7 @@ jobs:
           cp -r build/Release-iphoneos/PKGExtractor.app build/Payload/
           cd build
           zip -r PKGExtractor-unsigned.ipa Payload/
-          echo "📦 IPA size: $(du -sh PKGExtractor-unsigned.ipa | cut -f1)"
+          echo "IPA size: $(du -sh PKGExtractor-unsigned.ipa | cut -f1)"
 
       - name: Upload IPA artifact
         uses: actions/upload-artifact@v4
