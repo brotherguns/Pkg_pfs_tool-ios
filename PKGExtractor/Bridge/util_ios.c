@@ -43,6 +43,7 @@ void warning(const char* fmt, ...) {
     vsnprintf(buffer, sizeof(buffer), fmt, args);
     va_end(args);
     fprintf(stderr, "WARNING: %s\n", buffer);
+    pkg_ios_log_warning(buffer);  /* capture for error reporting */
 }
 
 /* CHANGED: longjmp instead of exit(1) */
