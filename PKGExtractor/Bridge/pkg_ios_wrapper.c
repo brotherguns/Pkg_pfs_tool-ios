@@ -124,25 +124,34 @@ const char* pkg_ios_last_error(void) {
  */
 static int ios_set_pfs_options(void* arg, struct pkg* pkg, struct pfs_options* opts) {
     UNUSED(arg);
-    UNUSED(pkg);
 
-    /*
-     * Inject the zero passcode on the first call (when keyset is still NULL).
-     * This replicates exactly what main.c does with --passcode 00000000...
-     *
-     * keymgr_alloc_title_keyset(KEYMGR_FAKE_CONTENT_ID, 0):
-     *   - Allocates a scratch keyset (not added to the hash table, won't be
-     *     freed by keymgr_finalize — acceptable small leak per extraction).
-     *   - KEYMGR_FAKE_CONTENT_ID is a placeholder; the actual content_id for
-     *     HMAC key derivation comes from opts->content_id which pkg.c sets
-     *     to pkg->hdr->content_id before our callback fires.
-     */
     if (!opts->keyset) {
-        opts->keyset = keymgr_alloc_title_keyset(KEYMGR_FAKE_CONTENT_ID, 0);
-        if (opts->keyset) {
-            /* passcode = all zeros, 32 bytes (KEYMGR_PASSCODE_SIZE) */
-            memset(opts->keyset->passcode, 0, sizeof(opts->keyset->passcode));
-            opts->keyset->flags.has_passcode = 1;
+        /*
+         * STEP 1: Try to find a title-specific keyset loaded from config.ini.
+         * If config.ini has a [content_id] section for this PKG (with the
+         * correct passcode), use it directly — avoids any encoding ambiguity.
+         */
+        if (pkg && pkg->hdr) {
+            opts->keyset = keymgr_get_title_keyset(pkg->hdr->content_id);
+        }
+
+        /*
+         * STEP 2: If no title keyset was found, allocate a scratch keyset and
+         * set the zero passcode — matching EXACTLY what the CLI does with
+         * --passcode 00000000000000000000000000000000.
+         *
+         * CRITICAL: The CLI stores s_passcode = strdup("00000000...00")
+         * which is 32 × ASCII '0' (0x30), NOT 32 × binary zero (0x00).
+         * gen_specific_key() feeds passcode bytes raw into SHA-256, so
+         * '0' (0x30) and NUL (0x00) produce completely different image_keys.
+         * The original bug was using memset(..., 0, ...) instead of '0'.
+         */
+        if (!opts->keyset) {
+            opts->keyset = keymgr_alloc_title_keyset(KEYMGR_FAKE_CONTENT_ID, 0);
+            if (opts->keyset) {
+                memset(opts->keyset->passcode, '0', sizeof(opts->keyset->passcode));
+                opts->keyset->flags.has_passcode = 1;
+            }
         }
     }
 
