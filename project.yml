@@ -7,6 +7,9 @@ options:
 
 # Compiler flags applied to every pkg_pfs_tool C source file.
 # -include injects darwin_compat.h before each .c translation unit.
+# NOTE: Only thirdparty/include is listed for mbedtls headers — this is intentional.
+# The vendored headers are 2.24.0 and the built libs are 2.28.9 (same ABI).
+# Adding mbedtls-ios/include would risk the compiler picking up mismatched headers.
 x-c-flags: &c_flags >-
   -std=c99
   -DNDEBUG
@@ -14,7 +17,6 @@ x-c-flags: &c_flags >-
   -include $(PROJECT_DIR)/darwin_compat.h
   -I$(PROJECT_DIR)/pkg_pfs_tool/src
   -I$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include
-  -I$(PROJECT_DIR)/mbedtls-ios/include
   -I$(PROJECT_DIR)/PKGExtractor/Bridge
 
 targets:
@@ -34,13 +36,14 @@ targets:
         CODE_SIGNING_ALLOWED: NO
         CODE_SIGN_IDENTITY: ""
         DEVELOPMENT_TEAM: ""
-        CODE_SIGN_ENTITLEMENTS: PKGExtractor/Entitlements.plist
+        # CODE_SIGN_ENTITLEMENTS intentionally omitted.
+        # With CODE_SIGNING_ALLOWED=NO xcodebuild ignores it anyway,
+        # and FeatherSign applies its own entitlements from your cert.
         LIBRARY_SEARCH_PATHS:
           - "$(PROJECT_DIR)/mbedtls-ios/lib"
         HEADER_SEARCH_PATHS:
           - "$(PROJECT_DIR)/pkg_pfs_tool/src"
           - "$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include"
-          - "$(PROJECT_DIR)/mbedtls-ios/include"
           - "$(PROJECT_DIR)/PKGExtractor/Bridge"
         OTHER_LDFLAGS:
           - "-lmbedcrypto"
