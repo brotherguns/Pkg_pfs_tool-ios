@@ -17,23 +17,25 @@ class ExtractionManager: ObservableObject {
         fileCount    = 0
         outputURL    = nil
 
-        // Config.ini is bundled in the app
+        // config.ini is bundled in the app
         guard let configPath = Bundle.main.path(forResource: "config", ofType: "ini") else {
-            lastError   = "config.ini not found in app bundle"
+            lastError    = "config.ini not found in app bundle"
             isExtracting = false
+            finished     = true
             return
         }
 
-        // Output goes to Documents/Extracted/<pkg-name>/
-        let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        let outDir = docs.appendingPathComponent("Extracted")
-                         .appendingPathComponent(pkgURL.deletingPathExtension().lastPathComponent)
+        // pkgURL is already inside Documents — no security scoping needed.
+        // Output: Documents/Extracted/<pkg-stem>/
+        let docs   = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+        let outDir = docs
+            .appendingPathComponent("Extracted")
+            .appendingPathComponent(pkgURL.deletingPathExtension().lastPathComponent)
 
-        let pkgPath  = pkgURL.path
-        let outPath  = outDir.path
-        let cfgPath  = configPath
+        let pkgPath = pkgURL.path
+        let outPath = outDir.path
+        let cfgPath = configPath
 
-        // Unretained self pointer for C callback
         let selfPtr = Unmanaged.passRetained(self).toOpaque()
 
         Task.detached(priority: .userInitiated) {
@@ -43,33 +45,25 @@ class ExtractionManager: ObservableObject {
                 cfgPath,
                 { ctx, rawPath in
                     guard let ctx, let rawPath else { return }
-                    let manager = Unmanaged<ExtractionManager>.fromOpaque(ctx).takeUnretainedValue()
+                    let mgr  = Unmanaged<ExtractionManager>.fromOpaque(ctx).takeUnretainedValue()
                     let name = String(cString: rawPath)
                     Task { @MainActor in
-                        manager.currentFile = name
-                        manager.fileCount  += 1
+                        mgr.currentFile  = name
+                        mgr.fileCount   += 1
                     }
                 },
                 selfPtr
             )
 
-            // Release the retained self
             Unmanaged<ExtractionManager>.fromOpaque(selfPtr).release()
 
-            let errMsg: String?
-            if result == 0 {
-                errMsg = nil
-            } else {
-                errMsg = String(cString: pkg_ios_last_error())
-            }
+            let errMsg: String? = result == 0 ? nil : String(cString: pkg_ios_last_error())
 
             await MainActor.run {
                 self.isExtracting = false
                 self.finished     = true
                 self.lastError    = errMsg
-                if result == 0 {
-                    self.outputURL = outDir
-                }
+                if result == 0 { self.outputURL = outDir }
             }
         }
     }
