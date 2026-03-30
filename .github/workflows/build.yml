@@ -21,7 +21,11 @@ jobs:
 
       - name: Build mbedtls for iOS arm64
         run: |
-          git clone --recurse-submodules --depth 1 --branch v3.6.1 https://github.com/Mbed-TLS/mbedtls.git mbedtls-src
+          # ⚠️  MUST use 2.x — the vendored headers in thirdparty/include are mbedtls 2.24.0.
+          # Linking a 3.x library against 2.x headers causes ABI mismatch and linker failure.
+          # 2.28.9 is the last 2.x LTS release and is API-compatible with 2.24.0.
+          # 2.x has NO git submodules — do NOT use --recurse-submodules.
+          git clone --depth 1 --branch v2.28.9 https://github.com/Mbed-TLS/mbedtls.git mbedtls-src
           cd mbedtls-src
           mkdir build-ios && cd build-ios
           IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
@@ -35,18 +39,20 @@ jobs:
             -DENABLE_PROGRAMS=OFF \
             -DMBEDTLS_FATAL_WARNINGS=OFF
           make -j$(sysctl -n hw.logicalcpu) mbedcrypto mbedtls mbedx509
-          mkdir -p ../../mbedtls-ios/lib ../../mbedtls-ios/include
+          mkdir -p ../../mbedtls-ios/lib
           cp library/libmbedcrypto.a library/libmbedtls.a library/libmbedx509.a \
              ../../mbedtls-ios/lib/
-          cp -r ../include/mbedtls ../../mbedtls-ios/include/
-          cp -r ../include/psa    ../../mbedtls-ios/include/
-          echo "✅ mbedtls built for iOS arm64"
+          echo "✅ mbedtls 2.28.9 built for iOS arm64"
+          echo "   libs: $(ls -lh ../../mbedtls-ios/lib/)"
 
       - name: Generate Xcode project
         run: xcodegen generate --spec project.yml
 
       - name: Build (unsigned)
         run: |
+          # set -o pipefail makes the pipe fail if xcodebuild fails,
+          # even when piped through xcpretty.
+          set -o pipefail
           xcodebuild \
             -project PKGExtractor.xcodeproj \
             -scheme PKGExtractor \
@@ -58,9 +64,16 @@ jobs:
             DEVELOPMENT_TEAM="" \
             EXPANDED_CODE_SIGN_IDENTITY="" \
             CONFIGURATION_BUILD_DIR="$(pwd)/build/Release-iphoneos" \
-            build 2>&1 | xcpretty || true
-          # Verify the .app was created
-          ls build/Release-iphoneos/PKGExtractor.app
+            build 2>&1 | xcpretty
+
+          # Verify the executable binary exists — not just the .app directory.
+          # The directory is created even on failed builds; the binary is not.
+          BINARY="build/Release-iphoneos/PKGExtractor.app/PKGExtractor"
+          if [ ! -f "$BINARY" ]; then
+            echo "❌ Build failed: executable not found at $BINARY"
+            exit 1
+          fi
+          echo "✅ Binary present: $(ls -lh $BINARY)"
 
       - name: Package IPA
         run: |
