@@ -209,6 +209,8 @@ static int check_pkg_file(const char* pkg_path, char* content_id_out) {
 static char* make_temp_config(const char* base_path,
                                const char* content_id,
                                const char* tmp_dir) {
+    (void)tmp_dir; /* unused — we always write to /tmp to avoid output_dir not existing yet */
+
     FILE* f = fopen(base_path, "rb");
     if (!f) return NULL;
     fseek(f, 0, SEEK_END);
@@ -224,7 +226,7 @@ static char* make_temp_config(const char* base_path,
 
     char* tmp_path = (char*)malloc(4096);
     if (!tmp_path) { free(base); return NULL; }
-    snprintf(tmp_path, 4096, "%s/keymgr_tmp.ini", tmp_dir);
+    snprintf(tmp_path, 4096, "/tmp/keymgr_tmp.ini");
 
     FILE* out = fopen(tmp_path, "wb");
     if (!out) { free(base); free(tmp_path); return NULL; }
