@@ -21,7 +21,7 @@ jobs:
 
       - name: Build mbedtls for iOS arm64
         run: |
-          git clone --depth 1 --branch v3.6.1 https://github.com/Mbed-TLS/mbedtls.git mbedtls-src
+          git clone --recurse-submodules --depth 1 --branch v3.6.1 https://github.com/Mbed-TLS/mbedtls.git mbedtls-src
           cd mbedtls-src
           mkdir build-ios && cd build-ios
           IOS_SDK=$(xcrun --sdk iphoneos --show-sdk-path)
