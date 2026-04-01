@@ -1085,6 +1085,13 @@ struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_opti
 			goto error;
 	}
 
+	/* ── VERBOSE: state after first callback ── */
+	warning("[DIAG] pkg_alloc: after 1st callback: keyset=%s  content_id=\"%s\"  finalized=%d  skip_keygen=%d",
+	        pfs_opts.keyset ? "SET" : "NULL",
+	        pkg->hdr->content_id,
+	        pfs_opts.finalized,
+	        pfs_opts.skip_keygen);
+
 	memset(&entry_check_args, 0, sizeof(entry_check_args));
 	pkg_enum_entries(pkg, &entry_check_cb, &entry_check_args, 1);
 
@@ -1100,13 +1107,28 @@ struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_opti
 
 	if (!pfs_opts.keyset && !pfs_opts.skip_keygen) {
 		pfs_opts.keyset = keymgr_get_title_keyset(pkg->hdr->content_id);
+		warning("[DIAG] pkg_alloc: keymgr_get_title_keyset(\"%s\") => %s",
+		        pkg->hdr->content_id,
+		        pfs_opts.keyset ? "FOUND" : "NULL");
 		if (!pfs_opts.keyset) {
 			pfs_opts.keyset = keymgr_alloc_title_keyset(pkg->hdr->content_id, 1);
 			if (!pfs_opts.keyset)
 				goto error;
-			if (!setup_keyset_by_image_key(pfs_opts.keyset, pkg, 0))
-				;// FIXME: goto error;
+			warning("[DIAG] pkg_alloc: allocated new keyset for \"%s\", trying EKPFS...",
+			        pkg->hdr->content_id);
+			if (!setup_keyset_by_image_key(pfs_opts.keyset, pkg, 0)) {
+				warning("[DIAG] pkg_alloc: setup_keyset_by_image_key FAILED (expected for fpkgs)");
+			} else {
+				warning("[DIAG] pkg_alloc: setup_keyset_by_image_key OK — EKPFS decryption succeeded");
+			}
 		} else {
+			warning("[DIAG] pkg_alloc: found config.ini keyset — flags: has_passcode=%d  has_image_key=%d  "
+			        "has_enc_data_key=%d  has_enc_tweak_key=%d  has_sig_hmac_key=%d",
+			        pfs_opts.keyset->flags.has_passcode,
+			        pfs_opts.keyset->flags.has_image_key,
+			        pfs_opts.keyset->flags.has_enc_data_key,
+			        pfs_opts.keyset->flags.has_enc_tweak_key,
+			        pfs_opts.keyset->flags.has_sig_hmac_key);
 			if (!pfs_opts.keyset->flags.has_passcode && !pfs_opts.keyset->flags.has_image_key && !pfs_opts.keyset->flags.has_enc_data_key && !pfs_opts.keyset->flags.has_enc_tweak_key && !pfs_opts.keyset->flags.has_sig_hmac_key) {
 				if (!setup_keyset_by_image_key(pfs_opts.keyset, pkg, 1))
 					goto error;
@@ -1114,9 +1136,32 @@ struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_opti
 		}
 	}
 
+	/* ── VERBOSE: state before second callback ── */
+	if (pfs_opts.keyset) {
+		warning("[DIAG] pkg_alloc: before 2nd callback: keyset->content_id=\"%s\"  "
+		        "has_passcode=%d  has_image_key=%d",
+		        pfs_opts.keyset->content_id,
+		        pfs_opts.keyset->flags.has_passcode,
+		        pfs_opts.keyset->flags.has_image_key);
+	} else {
+		warning("[DIAG] pkg_alloc: before 2nd callback: keyset=NULL");
+	}
+
 	if (set_pfs_options_cb) {
 		if (!(*set_pfs_options_cb)(set_pfs_options_cb_arg, pkg, &pfs_opts))
 			goto error;
+	}
+
+	/* ── VERBOSE: state after second callback ── */
+	if (pfs_opts.keyset) {
+		char _pc[KEYMGR_PASSCODE_SIZE * 2 + 1];
+		snprintf_hex(_pc, sizeof(_pc), (const uint8_t*)pfs_opts.keyset->passcode, KEYMGR_PASSCODE_SIZE);
+		warning("[DIAG] pkg_alloc: after 2nd callback: keyset->content_id=\"%s\"  "
+		        "has_passcode=%d  has_image_key=%d  passcode(hex)=%s",
+		        pfs_opts.keyset->content_id,
+		        pfs_opts.keyset->flags.has_passcode,
+		        pfs_opts.keyset->flags.has_image_key,
+		        _pc);
 	}
 
 	if (!pfs_opts.keyset && pfs_opts.skip_keygen) {

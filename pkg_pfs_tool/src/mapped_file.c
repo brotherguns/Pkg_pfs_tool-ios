@@ -1,5 +1,9 @@
 #include "mapped_file.h"
 
+#include <stdio.h>
+#include <errno.h>
+#include <string.h>
+
 #ifndef _WIN32
 #	include <sys/mman.h>
 #else
@@ -81,30 +85,60 @@ struct file_map* map_files(const char* const* file_paths, size_t file_count) {
 			goto error;
 
 		fd = open(file_paths[0], O_RDONLY | O_LARGEFILE | O_BINARY);
-		if (fd < 0)
+		if (fd < 0) {
+			fprintf(stderr, "[DIAG] map_files: open() failed: %s  errno=%d (%s)\n",
+			        file_paths[0], errno, strerror(errno));
 			goto error;
+		}
 
-		if (fstat64(fd, &st) < 0)
+		if (fstat64(fd, &st) < 0) {
+			fprintf(stderr, "[DIAG] map_files: fstat64() failed: errno=%d (%s)\n",
+			        errno, strerror(errno));
 			goto error;
+		}
 		if (!S_ISREG(st.st_mode)) {
+			fprintf(stderr, "[DIAG] map_files: not a regular file (mode=0%o)\n",
+			        (unsigned)st.st_mode);
 			errno = EINVAL;
 			goto error;
 		}
 
 		file_size = (uint64_t)st.st_size;
 		if (file_size != map->segments[0].size) {
+			fprintf(stderr, "[DIAG] map_files: file size changed between stat calls: "
+			        "%" PRIu64 " vs %" PRIu64 "\n",
+			        file_size, map->segments[0].size);
 			errno = EINVAL;
 			goto error;
 		}
 
+		fprintf(stderr, "[DIAG] map_files: single-file fast path: size=%" PRIu64 "  path=%s\n",
+		        file_size, file_paths[0]);
+
 		data = mmap(NULL, (size_t)file_size, PROT_READ, MAP_SHARED, fd, 0);
-		if (data == MAP_FAILED)
+		if (data == MAP_FAILED) {
+			fprintf(stderr, "[DIAG] map_files: mmap() failed: errno=%d (%s)  size=%" PRIu64 "\n",
+			        errno, strerror(errno), file_size);
 			goto error;
+		}
+
+		fprintf(stderr, "[DIAG] map_files: mmap OK: addr=%p  size=%" PRIu64 "\n",
+		        data, file_size);
+
+		/* Quick sanity: read first 4 bytes to confirm mapping is live */
+		{
+			uint8_t probe[4];
+			memcpy(probe, data, 4);
+			fprintf(stderr, "[DIAG] map_files: first 4 bytes: %02X %02X %02X %02X\n",
+			        probe[0], probe[1], probe[2], probe[3]);
+		}
 
 		map->fds[0] = fd;
 		map->segments[0].base = data;
 		map->data = (uint8_t*)data;
 		map->size = total_file_size;
+		map->write = 0;
+		map->submap = 0;
 
 		fd = -1;
 		data = MAP_FAILED;

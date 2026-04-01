@@ -148,6 +148,37 @@ struct pfs* pfs_alloc(struct pfs_io_callbacks* io, const struct pfs_options* opt
 			goto error;
 		}
 
+		/* ── VERBOSE: dump full keyset state before key generation ── */
+		{
+			char _pc_hex[KEYMGR_PASSCODE_SIZE * 2 + 1];
+			char _ik_hex[KEYMGR_HASH_SIZE * 2 + 1];
+			char _seed_hex[KEYMGR_SEED_SIZE * 2 + 1];
+			char _cid_buf[KEYMGR_CONTENT_ID_SIZE + 1];
+			struct keymgr_title_keyset* _ks = pfs->opts->keyset;
+
+			snprintf_hex(_pc_hex, sizeof(_pc_hex), (const uint8_t*)_ks->passcode, KEYMGR_PASSCODE_SIZE);
+			snprintf_hex(_ik_hex, sizeof(_ik_hex), _ks->image_key, KEYMGR_HASH_SIZE);
+			snprintf_hex(_seed_hex, sizeof(_seed_hex), pfs->hdr.crypt_seed, KEYMGR_SEED_SIZE);
+			memset(_cid_buf, 0, sizeof(_cid_buf));
+			if (content_id) strncpy(_cid_buf, content_id, KEYMGR_CONTENT_ID_SIZE);
+
+			warning("[DIAG] pfs_alloc: is_inner=%d  is_signed=%d  is_encrypted=%d",
+			        is_inner, pfs->is_signed, pfs->is_encrypted);
+			warning("[DIAG] pfs_alloc: content_id used for keygen = \"%s\"", _cid_buf);
+			warning("[DIAG] pfs_alloc: keyset->content_id          = \"%s\"", _ks->content_id);
+			warning("[DIAG] pfs_alloc: crypt_seed                  = %s", _seed_hex);
+			warning("[DIAG] pfs_alloc: keyset flags: has_passcode=%d  has_image_key=%d  "
+			        "has_enc_data_key=%d  has_enc_tweak_key=%d  has_sig_hmac_key=%d",
+			        _ks->flags.has_passcode, _ks->flags.has_image_key,
+			        _ks->flags.has_enc_data_key, _ks->flags.has_enc_tweak_key,
+			        _ks->flags.has_sig_hmac_key);
+			warning("[DIAG] pfs_alloc: passcode (hex)  = %s", _pc_hex);
+			warning("[DIAG] pfs_alloc: image_key (hex) = %s", _ik_hex);
+			warning("[DIAG] pfs_alloc: skip_signature_check=%d  skip_block_hash_check=%d  finalized=%d",
+			        pfs->opts->skip_signature_check, pfs->opts->skip_block_hash_check,
+			        pfs->opts->finalized);
+		}
+
 #if defined(ENABLE_SD_KEYGEN)
 		if (pfs->opts->is_sd) {
 			if (!pfs_get_sd_content_key(pfs, sd_content_key)) {
@@ -170,6 +201,30 @@ gen_keys_failed:
 #if defined(ENABLE_SD_KEYGEN)
 		}
 #endif
+
+		/* ── VERBOSE: dump derived keys AFTER generation ── */
+		{
+			char _etk_hex[KEYMGR_AES_KEY_SIZE * 2 + 1];
+			char _edk_hex[KEYMGR_AES_KEY_SIZE * 2 + 1];
+			char _shk_hex[KEYMGR_HMAC_KEY_SIZE * 2 + 1];
+			char _ik2_hex[KEYMGR_HASH_SIZE * 2 + 1];
+			struct keymgr_title_keyset* _ks = pfs->opts->keyset;
+
+			snprintf_hex(_etk_hex, sizeof(_etk_hex), _ks->enc_tweak_key, KEYMGR_AES_KEY_SIZE);
+			snprintf_hex(_edk_hex, sizeof(_edk_hex), _ks->enc_data_key, KEYMGR_AES_KEY_SIZE);
+			snprintf_hex(_shk_hex, sizeof(_shk_hex), _ks->sig_hmac_key, KEYMGR_HMAC_KEY_SIZE);
+			snprintf_hex(_ik2_hex, sizeof(_ik2_hex), image_key, KEYMGR_HASH_SIZE);
+
+			warning("[DIAG] post-keygen: image_key      = %s", _ik2_hex);
+			warning("[DIAG] post-keygen: enc_tweak_key   = %s", _etk_hex);
+			warning("[DIAG] post-keygen: enc_data_key    = %s", _edk_hex);
+			warning("[DIAG] post-keygen: sig_hmac_key    = %s", _shk_hex);
+			warning("[DIAG] post-keygen: flags: has_passcode=%d  has_image_key=%d  "
+			        "has_enc_data_key=%d  has_enc_tweak_key=%d  has_sig_hmac_key=%d",
+			        _ks->flags.has_passcode, _ks->flags.has_image_key,
+			        _ks->flags.has_enc_data_key, _ks->flags.has_enc_tweak_key,
+			        _ks->flags.has_sig_hmac_key);
+		}
 
 		if (pfs->is_signed) {
 			header_data = (uint8_t*)malloc(PFS_HEADER_SIZE);
@@ -194,6 +249,26 @@ gen_keys_failed:
 					if (!status) {
 						goto gen_keys_failed;
 					}
+
+					/* ── VERBOSE: dump keys after algo_variant=1 regen ── */
+					{
+						char _etk2[KEYMGR_AES_KEY_SIZE * 2 + 1];
+						char _edk2[KEYMGR_AES_KEY_SIZE * 2 + 1];
+						char _shk2[KEYMGR_HMAC_KEY_SIZE * 2 + 1];
+						char _ik3[KEYMGR_HASH_SIZE * 2 + 1];
+						struct keymgr_title_keyset* _ks = pfs->opts->keyset;
+
+						snprintf_hex(_etk2, sizeof(_etk2), _ks->enc_tweak_key, KEYMGR_AES_KEY_SIZE);
+						snprintf_hex(_edk2, sizeof(_edk2), _ks->enc_data_key, KEYMGR_AES_KEY_SIZE);
+						snprintf_hex(_shk2, sizeof(_shk2), _ks->sig_hmac_key, KEYMGR_HMAC_KEY_SIZE);
+						snprintf_hex(_ik3, sizeof(_ik3), image_key, KEYMGR_HASH_SIZE);
+
+						warning("[DIAG] post-keygen (algo_variant=1): image_key    = %s", _ik3);
+						warning("[DIAG] post-keygen (algo_variant=1): enc_tweak    = %s", _etk2);
+						warning("[DIAG] post-keygen (algo_variant=1): enc_data     = %s", _edk2);
+						warning("[DIAG] post-keygen (algo_variant=1): sig_hmac     = %s", _shk2);
+					}
+
 					pfs_sign_buffer(pfs, header_data, PFS_HEADER_SIZE, hash);
 					if (memcmp(hash, pfs->hdr.header_hash, sizeof(hash)) != 0) {
 invalid_header_hash:
