@@ -70,6 +70,49 @@ struct file_map* map_files(const char* const* file_paths, size_t file_count) {
 		total_file_size += file_size;
 	}
 
+	/*
+	 * Fast path: single file — just mmap it directly.
+	 * Avoids the MAP_FIXED reserve-unmap-remap trick which is racy
+	 * on iOS where the kernel aggressively reclaims unmapped pages.
+	 */
+	if (file_count == 1) {
+		map->file_paths[0] = strdup(file_paths[0]);
+		if (!map->file_paths[0])
+			goto error;
+
+		fd = open(file_paths[0], O_RDONLY | O_LARGEFILE | O_BINARY);
+		if (fd < 0)
+			goto error;
+
+		if (fstat64(fd, &st) < 0)
+			goto error;
+		if (!S_ISREG(st.st_mode)) {
+			errno = EINVAL;
+			goto error;
+		}
+
+		file_size = (uint64_t)st.st_size;
+		if (file_size != map->segments[0].size) {
+			errno = EINVAL;
+			goto error;
+		}
+
+		data = mmap(NULL, (size_t)file_size, PROT_READ, MAP_SHARED, fd, 0);
+		if (data == MAP_FAILED)
+			goto error;
+
+		map->fds[0] = fd;
+		map->segments[0].base = data;
+		map->data = (uint8_t*)data;
+		map->size = total_file_size;
+
+		fd = -1;
+		data = MAP_FAILED;
+
+		return map;
+	}
+
+	/* Multi-file path: reserve contiguous address space, then MAP_FIXED each piece. */
 	file_size = total_file_size;
 	data = mmap(NULL, (size_t)file_size, PROT_READ, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
 	if (data == MAP_FAILED)
