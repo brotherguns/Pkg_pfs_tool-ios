@@ -28,6 +28,7 @@
 #include "pkg.h"
 #include "pfs.h"
 #include "keymgr.h"
+#include "crypto.h"
 #include "util.h"
 
 #include <stdio.h>
@@ -363,9 +364,22 @@ int pkg_ios_extract(
         append_warn_log_to_error();
         if (pkg) { pkg_free(pkg); pkg = NULL; }
         keymgr_finalize();
+        crypto_finalize();
         g_pkg_abort_active = 0;
         return -1;
     }
+
+    /* Initialize mbedtls crypto (SHA-256 context, AES, RNG).
+     * WITHOUT THIS CALL, s_sha256_md_info is NULL and every
+     * sha256_buffer / hmac_sha256_buffer silently produces garbage. */
+    if (!crypto_initialize()) {
+        set_error("crypto_initialize failed — mbedtls could not start.\n"
+                  "SHA-256, HMAC, and AES will not work.");
+        DIAG("!! crypto_initialize FAILED");
+        append_warn_log_to_error();
+        goto done;
+    }
+    DIAG("crypto_initialize OK");
 
     /* Load global keys from config.ini */
     DIAG("Calling keymgr_initialize...");
@@ -451,6 +465,7 @@ done:
     DIAG("========== pkg_ios_extract END (ret=%d) ==========", ret);
     if (pkg) pkg_free(pkg);
     keymgr_finalize();
+    crypto_finalize();
     g_pkg_abort_active = 0;
     return ret;
 }
