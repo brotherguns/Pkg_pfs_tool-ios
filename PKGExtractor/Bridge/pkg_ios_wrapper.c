@@ -13,13 +13,12 @@
  *   instead of RSA-decrypting the EKPFS blob (which requires retail_ekpfs_key
  *   or fake_ekpfs_key to be correct for that specific PKG signing).
  *
- *   Our wrapper was NOT setting opts->keyset at all, so pkg.c fell through to
- *   setup_keyset_by_image_key() which tried EKPFS decryption → wrong image_key
- *   → hash mismatch.
- *
- *   pkg.c calls our callback TWICE. On the first call opts->keyset is NULL.
- *   We must set it with the zero passcode then, so pkg.c skips EKPFS decryption.
- *   On the second call opts->keyset is already set, so we leave it alone.
+ *   IMPORTANT: The CLI leaves the keyset NULL in its FIRST callback and lets
+ *   pkg_alloc() handle keyset creation through its normal path (lines 1101-1114
+ *   of pkg.c). The passcode is only applied in the SECOND callback. We must
+ *   mirror this exact flow — setting the keyset prematurely in the first
+ *   callback bypasses pkg_alloc's keyset-setup logic and can cause subtle
+ *   key-derivation failures.
  */
 
 #include "pkg_ios_wrapper.h"
@@ -115,50 +114,33 @@ const char* pkg_ios_last_error(void) {
 /* ------------------------------------------------------------------ */
 /*
  * pkg.c calls this callback TWICE:
- *   1st call: opts->keyset is NULL. We allocate a scratch keyset and set
- *             the zero passcode. pkg.c then sees keyset != NULL and skips
- *             setup_keyset_by_image_key() (which would try EKPFS decryption).
- *   2nd call: opts->keyset is already set. We leave it alone.
  *
- * We also always set the skip flags so signature/hash checks are bypassed.
+ *   1st call (pfs_opts.keyset == NULL):
+ *     Do NOT touch keyset. Return immediately so pkg_alloc runs its
+ *     normal keyset-creation path (lines 1101-1114): look up the title
+ *     keyset from config.ini → if not found, allocate one with the real
+ *     content_id and attempt EKPFS decryption (fails gracefully for
+ *     fpkgs). This is exactly what the CLI does.
+ *
+ *   2nd call (pfs_opts.keyset != NULL):
+ *     Apply the zero passcode to the keyset, just like the CLI's
+ *     --passcode flag does in tweak_pfs_options(). has_passcode takes
+ *     priority in keymgr_generate_keys_for_title_keyset, so this
+ *     overrides any EKPFS-derived image_key — matching CLI behaviour.
  */
 static int ios_set_pfs_options(void* arg, struct pkg* pkg, struct pfs_options* opts) {
     UNUSED(arg);
+    UNUSED(pkg);
 
-    if (!opts->keyset) {
-        /*
-         * STEP 1: Try to find a title-specific keyset loaded from config.ini.
-         * If config.ini has a [content_id] section for this PKG (with the
-         * correct passcode), use it directly — avoids any encoding ambiguity.
-         */
-        if (pkg && pkg->hdr) {
-            opts->keyset = keymgr_get_title_keyset(pkg->hdr->content_id);
-        }
-
-        /*
-         * STEP 2: If no title keyset was found, allocate a scratch keyset and
-         * set the zero passcode — matching EXACTLY what the CLI does with
-         * --passcode 00000000000000000000000000000000.
-         *
-         * CRITICAL: The CLI stores s_passcode = strdup("00000000...00")
-         * which is 32 × ASCII '0' (0x30), NOT 32 × binary zero (0x00).
-         * gen_specific_key() feeds passcode bytes raw into SHA-256, so
-         * '0' (0x30) and NUL (0x00) produce completely different image_keys.
-         * The original bug was using memset(..., 0, ...) instead of '0'.
-         */
-        if (!opts->keyset) {
-            opts->keyset = keymgr_alloc_title_keyset(KEYMGR_FAKE_CONTENT_ID, 0);
-            if (opts->keyset) {
-                memset(opts->keyset->passcode, '0', sizeof(opts->keyset->passcode));
-                opts->keyset->flags.has_passcode = 1;
-            }
-        }
+    if (opts->keyset) {
+        /* ── Second call: apply zero passcode (mirrors CLI --passcode) ── */
+        memset(opts->keyset->passcode, '0', sizeof(opts->keyset->passcode));
+        opts->keyset->flags.has_passcode = 1;
     }
 
-    /* Always skip signature and block-hash checks */
+    /* Always relax checks — we trust the passcode, not the PKG signatures */
     opts->skip_signature_check  = 1;
     opts->skip_block_hash_check = 1;
-    opts->finalized             = 1;
 
     return 1;
 }
@@ -294,10 +276,13 @@ int pkg_ios_extract(
     /*
      * Open and decrypt the PKG.
      *
-     * ios_set_pfs_options (our callback) will inject a zero passcode into the
-     * pfs_options keyset on the first callback invocation, causing pkg.c to use
-     * HMAC key derivation (content_id + zero_passcode) instead of EKPFS blob
-     * decryption. This matches:
+     * ios_set_pfs_options (our callback) mirrors the CLI --passcode flow:
+     *   1st call: leaves keyset NULL so pkg_alloc handles keyset creation
+     *             through its normal path (config.ini lookup → EKPFS attempt).
+     *   2nd call: applies the zero passcode to the keyset that pkg_alloc
+     *             created, exactly like the CLI's tweak_pfs_options().
+     *
+     * This matches:
      *   ./pkg_pfs_tool --passcode 00000000000000000000000000000000 -u <pkg> <out>
      */
     pkg = pkg_alloc(pkg_path, ios_set_pfs_options, NULL);
