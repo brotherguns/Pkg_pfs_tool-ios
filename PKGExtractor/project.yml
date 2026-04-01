@@ -1,0 +1,128 @@
+name: PKGExtractor
+options:
+  bundleIdPrefix: com.brotherguns
+  deploymentTarget:
+    iOS: "15.0"
+  xcodeVersion: "15.4"
+
+# Compiler flags applied to every pkg_pfs_tool C source file.
+# -include injects darwin_compat.h before each .c translation unit.
+# NOTE: Only thirdparty/include is listed for mbedtls headers — this is intentional.
+# The vendored headers are 2.24.0 and the built libs are 2.28.9 (same ABI).
+# Adding mbedtls-ios/include would risk the compiler picking up mismatched headers.
+x-c-flags: &c_flags >-
+  -std=c99
+  -DNDEBUG
+  -Wno-everything
+  -include $(PROJECT_DIR)/darwin_compat.h
+  -I$(PROJECT_DIR)/pkg_pfs_tool/src
+  -I$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include -I$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include/uthash
+  -I$(PROJECT_DIR)/PKGExtractor/Bridge
+
+targets:
+  PKGExtractor:
+    type: application
+    platform: iOS
+
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.brotherguns.pkgextractor
+        INFOPLIST_FILE: PKGExtractor/Info.plist
+        SWIFT_OBJC_BRIDGING_HEADER: PKGExtractor/Bridge/PKGBridge-Bridging-Header.h
+        SWIFT_VERSION: "5.9"
+        IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+        ENABLE_BITCODE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        CODE_SIGNING_ALLOWED: NO
+        CODE_SIGN_IDENTITY: ""
+        DEVELOPMENT_TEAM: ""
+        # CODE_SIGN_ENTITLEMENTS intentionally omitted.
+        # With CODE_SIGNING_ALLOWED=NO xcodebuild ignores it anyway,
+        # and FeatherSign applies its own entitlements from your cert.
+        LIBRARY_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/mbedtls-ios/lib"
+        HEADER_SEARCH_PATHS:
+          - "$(PROJECT_DIR)/pkg_pfs_tool/src"
+          - "$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include"
+          - "$(PROJECT_DIR)/pkg_pfs_tool/thirdparty/include/uthash"
+          - "$(PROJECT_DIR)/PKGExtractor/Bridge"
+        OTHER_LDFLAGS:
+          - "-lmbedcrypto"
+          - "-lmbedtls"
+          - "-lmbedx509"
+          - "-lz"
+
+    sources:
+      # ── Swift app ──────────────────────────────────────────────────
+      - path: PKGExtractor/PKGExtractorApp.swift
+      - path: PKGExtractor/ContentView.swift
+      - path: PKGExtractor/ExtractionManager.swift
+      - path: PKGExtractor/Assets.xcassets
+      - path: PKGExtractor/Info.plist
+        buildPhase: none
+      - path: PKGExtractor/Entitlements.plist
+        buildPhase: none
+
+      # ── Bridge headers (not compiled, just added to project) ───────
+      - path: PKGExtractor/Bridge/PKGBridge-Bridging-Header.h
+        buildPhase: none
+      - path: PKGExtractor/Bridge/pkg_ios_abort.h
+        buildPhase: none
+      - path: PKGExtractor/Bridge/pkg_ios_wrapper.h
+        buildPhase: none
+
+      # ── Bridge C files ─────────────────────────────────────────────
+      - path: PKGExtractor/Bridge/pkg_ios_wrapper.c
+        compilerFlags: *c_flags
+      - path: PKGExtractor/Bridge/util_ios.c
+        compilerFlags: *c_flags
+
+      # ── config.ini bundled as a resource ──────────────────────────
+      - path: PKGExtractor/config.ini
+        buildPhase: resources
+
+      # ── pkg_pfs_tool C source (all files EXCEPT main.c and util.c) ─
+      - path: pkg_pfs_tool/src/compression.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/config.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/crypto.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/dict.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/gp4.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/keymgr.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/keys.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/mapped_file.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_block.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_dinode.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_dump.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_io.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_lookup.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_parsers.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_sd.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pfs_util.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/pkg.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/playgo.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/self.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/sfo.c
+        compilerFlags: *c_flags
+      - path: pkg_pfs_tool/src/wildcard.c
+        compilerFlags: *c_flags
