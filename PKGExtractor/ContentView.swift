@@ -115,9 +115,14 @@ struct ContentView: View {
                     Label("Extraction failed", systemImage: "xmark.circle.fill")
                         .foregroundColor(.red)
                         .font(.headline)
-                    Text(err)
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                    ScrollView {
+                        Text(err)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundColor(.secondary)
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .frame(maxHeight: 400)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .padding()
