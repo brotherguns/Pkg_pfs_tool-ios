@@ -57,6 +57,7 @@ targets:
       - path: PKGExtractor/PKGExtractorApp.swift
       - path: PKGExtractor/ContentView.swift
       - path: PKGExtractor/ExtractionManager.swift
+      - path: PKGExtractor/SELFConverter.swift
       - path: PKGExtractor/Assets.xcassets
       - path: PKGExtractor/Info.plist
         buildPhase: none
