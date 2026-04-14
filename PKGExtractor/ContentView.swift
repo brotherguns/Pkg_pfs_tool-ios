@@ -1,9 +1,24 @@
+//
+//  ContentView.swift
+//
+//  Main UI for PKG Extractor.
+//  Adds:
+//    • File picker sheet — choose which files to extract from a PKG
+//    • eboot.bin → eboot.elf conversion status in the result view
+//
+
 import SwiftUI
 
 struct ContentView: View {
     @StateObject private var manager = ExtractionManager()
-    @State private var pkgFiles: [URL] = []
-    @State private var selectedPKG: URL? = nil
+
+    @State private var pkgFiles:      [URL]         = []
+    @State private var selectedPKG:   URL?           = nil
+
+    // File picker state
+    @State private var showFilePicker  = false
+    @State private var pickerPKG:      URL?           = nil
+    @State private var selectedFiles:  Set<String>   = []
 
     var body: some View {
         NavigationView {
@@ -53,7 +68,7 @@ struct ContentView: View {
                 } else {
                     List(pkgFiles, id: \.path) { url in
                         PKGRow(url: url, isSelected: selectedPKG == url, manager: manager) {
-                            startExtraction(url: url)
+                            beginFilePicking(url: url)
                         }
                     }
                     .listStyle(.insetGrouped)
@@ -71,7 +86,7 @@ struct ContentView: View {
                     Button(action: refreshList) {
                         Image(systemName: "arrow.clockwise")
                     }
-                    .disabled(manager.isExtracting)
+                    .disabled(manager.isExtracting || manager.isListing)
                 }
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Open Files") {
@@ -81,14 +96,44 @@ struct ContentView: View {
                     }
                 }
             }
+            // ── File picker sheet ──────────────────────────────────────
+            .sheet(isPresented: $showFilePicker) {
+                if let pkg = pickerPKG {
+                    FilePickerSheet(
+                        pkgName:       pkg.lastPathComponent,
+                        manager:       manager,
+                        selectedFiles: $selectedFiles
+                    ) {
+                        // Extract tapped
+                        showFilePicker = false
+                        startExtraction(url: pkg, files: selectedFiles)
+                    } onCancel: {
+                        showFilePicker = false
+                        pickerPKG      = nil
+                        selectedPKG    = nil
+                    }
+                }
+            }
         }
         .onAppear(perform: refreshList)
     }
 
-    // ── Status / progress area ─────────────────────────────────────────
+    // ── Status / progress area ─────────────────────────────────────────────
     @ViewBuilder
     private var statusArea: some View {
-        if manager.isExtracting {
+        if manager.isListing {
+            VStack(spacing: 6) {
+                ProgressView()
+                    .scaleEffect(1.3)
+                Text("Reading PKG contents…")
+                    .font(.headline)
+            }
+            .frame(maxWidth: .infinity)
+            .padding()
+            .background(Color(.systemGray6))
+            .cornerRadius(12)
+
+        } else if manager.isExtracting {
             VStack(spacing: 6) {
                 ProgressView()
                     .scaleEffect(1.3)
@@ -109,6 +154,7 @@ struct ContentView: View {
             .padding()
             .background(Color(.systemGray6))
             .cornerRadius(12)
+
         } else if manager.finished {
             if let err = manager.lastError {
                 VStack(alignment: .leading, spacing: 6) {
@@ -128,6 +174,7 @@ struct ContentView: View {
                 .padding()
                 .background(Color(.systemGray6))
                 .cornerRadius(12)
+
             } else {
                 VStack(spacing: 6) {
                     Label("Done — \(manager.fileCount) files", systemImage: "checkmark.circle.fill")
@@ -137,6 +184,13 @@ struct ContentView: View {
                         Text(out.lastPathComponent)
                             .font(.caption)
                             .foregroundColor(.secondary)
+                    }
+                    // ELF conversion result
+                    if let elfMsg = manager.elfConversionResult {
+                        Label(elfMsg,
+                              systemImage: elfMsg.contains("✓") ? "checkmark.seal.fill" : "info.circle")
+                            .font(.caption)
+                            .foregroundColor(elfMsg.contains("✓") ? .blue : .secondary)
                     }
                     Text("Output is in PKGExtractor → Extracted in Files app")
                         .font(.caption2)
@@ -148,6 +202,7 @@ struct ContentView: View {
                 .background(Color(.systemGray6))
                 .cornerRadius(12)
             }
+
         } else {
             Text("Files app → On My iPhone → PKGExtractor → paste .pkg here")
                 .font(.caption2)
@@ -169,21 +224,29 @@ struct ContentView: View {
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
     }
 
-    private func startExtraction(url: URL) {
-        guard !manager.isExtracting else { return }
-        selectedPKG = url
-        manager.extract(pkgURL: url)
+    /// Tap handler: start listing files then show the picker sheet.
+    private func beginFilePicking(url: URL) {
+        guard !manager.isExtracting && !manager.isListing else { return }
+        selectedPKG    = url
+        pickerPKG      = url
+        selectedFiles  = []
+        showFilePicker = true
+        manager.listFiles(pkgURL: url)
+    }
+
+    private func startExtraction(url: URL, files: Set<String>) {
+        manager.extract(pkgURL: url, selectedFiles: files.isEmpty ? nil : files)
     }
 }
 
-// ── Per-row component ──────────────────────────────────────────────────
+// ── Per-row component ───────────────────────────────────────────────────────
 struct PKGRow: View {
-    let url: URL
+    let url:        URL
     let isSelected: Bool
-    let manager: ExtractionManager
-    let onTap: () -> Void
+    let manager:    ExtractionManager
+    let onTap:      () -> Void
 
-    @State private var fileSize: String = ""
+    @State private var fileSize = ""
 
     var body: some View {
         Button(action: onTap) {
@@ -204,7 +267,7 @@ struct PKGRow: View {
 
                 Spacer()
 
-                if isSelected && manager.isExtracting {
+                if isSelected && (manager.isExtracting || manager.isListing) {
                     ProgressView()
                 } else {
                     Image(systemName: "chevron.right")
@@ -214,13 +277,188 @@ struct PKGRow: View {
             }
             .padding(.vertical, 4)
         }
-        .disabled(manager.isExtracting)
+        .disabled(manager.isExtracting || manager.isListing)
         .onAppear {
             if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
                let bytes = attrs.fileSize {
                 fileSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
             }
         }
+    }
+}
+
+// ── File Picker Sheet ───────────────────────────────────────────────────────
+struct FilePickerSheet: View {
+    let pkgName:       String
+    @ObservedObject var manager: ExtractionManager
+    @Binding var selectedFiles: Set<String>
+    let onExtract:     () -> Void
+    let onCancel:      () -> Void
+
+    // Local search / filter
+    @State private var searchText = ""
+
+    private var displayedFiles: [String] {
+        let files = manager.listedFiles
+        guard !searchText.isEmpty else { return files }
+        return files.filter { $0.localizedCaseInsensitiveContains(searchText) }
+    }
+
+    private var allSelected: Bool {
+        !manager.listedFiles.isEmpty &&
+        manager.listedFiles.allSatisfy { selectedFiles.contains($0) }
+    }
+
+    var body: some View {
+        NavigationView {
+            Group {
+                if manager.isListing {
+                    // Still scanning PKG
+                    VStack(spacing: 16) {
+                        ProgressView()
+                            .scaleEffect(1.4)
+                        Text("Reading PKG contents…")
+                            .font(.headline)
+                        Text(pkgName)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                } else if let err = manager.listError {
+                    // Listing failed
+                    VStack(spacing: 12) {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: 44))
+                            .foregroundColor(.red)
+                        Text("Could not read PKG contents")
+                            .font(.headline)
+                        Text(err)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                } else {
+                    // File list
+                    List {
+                        // Select All / None row
+                        HStack {
+                            Image(systemName: allSelected ? "checkmark.circle.fill" : "circle")
+                                .foregroundColor(allSelected ? .blue : .secondary)
+                            Text(allSelected ? "Deselect All" : "Select All")
+                                .font(.body)
+                            Spacer()
+                            Text("\(selectedFiles.count) of \(manager.listedFiles.count)")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .contentShape(Rectangle())
+                        .onTapGesture {
+                            if allSelected {
+                                selectedFiles = []
+                            } else {
+                                selectedFiles = Set(manager.listedFiles)
+                            }
+                        }
+
+                        ForEach(displayedFiles, id: \.self) { path in
+                            FilePickerRow(
+                                path: path,
+                                isSelected: selectedFiles.contains(path)
+                            ) {
+                                if selectedFiles.contains(path) {
+                                    selectedFiles.remove(path)
+                                } else {
+                                    selectedFiles.insert(path)
+                                }
+                            }
+                        }
+                    }
+                    .listStyle(.insetGrouped)
+                    .searchable(text: $searchText, prompt: "Filter files…")
+                }
+            }
+            .navigationTitle("Choose Files")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button("Cancel", action: onCancel)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
+                    Button {
+                        onExtract()
+                    } label: {
+                        Text(selectedFiles.isEmpty ? "Extract All" : "Extract (\(selectedFiles.count))")
+                            .bold()
+                    }
+                    .disabled(manager.isListing)
+                }
+            }
+        }
+    }
+}
+
+// ── Single row in the file picker ───────────────────────────────────────────
+struct FilePickerRow: View {
+    let path:       String
+    let isSelected: Bool
+    let onToggle:   () -> Void
+
+    private var icon: String {
+        if path.hasSuffix("/")     { return "folder.fill" }
+        let ext = (path as NSString).pathExtension.lowercased()
+        switch ext {
+        case "bin", "elf", "self": return "cpu"
+        case "pkg":                return "shippingbox.fill"
+        case "sfo":                return "doc.badge.gearshape"
+        case "png", "jpg", "dds":  return "photo"
+        case "xml", "json":        return "curlybraces"
+        default:                   return "doc"
+        }
+    }
+
+    private var fileName: String {
+        (path as NSString).lastPathComponent
+    }
+
+    private var directory: String {
+        let dir = (path as NSString).deletingLastPathComponent
+        return dir.isEmpty ? "" : dir + "/"
+    }
+
+    var body: some View {
+        Button(action: onToggle) {
+            HStack(spacing: 12) {
+                Image(systemName: icon)
+                    .foregroundColor(.blue)
+                    .frame(width: 24)
+
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(fileName)
+                        .font(.body)
+                        .foregroundColor(.primary)
+                        .lineLimit(1)
+                    if !directory.isEmpty {
+                        Text(directory)
+                            .font(.caption2)
+                            .foregroundColor(.secondary)
+                            .lineLimit(1)
+                    }
+                }
+
+                Spacer()
+
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .foregroundColor(isSelected ? .blue : Color(.systemGray4))
+                    .font(.title3)
+            }
+            .padding(.vertical, 2)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
     }
 }
 
