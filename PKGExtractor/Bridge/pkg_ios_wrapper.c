@@ -2,23 +2,9 @@
  * pkg_ios_wrapper.c
  *
  * Bridges pkg_pfs_tool's C library to the iOS Swift layer.
- *
- * Root cause of previous failures:
- *   The original command that works is:
- *     ./pkg_pfs_tool --passcode 00000000000000000000000000000000 -u <pkg> <out>
- *
- *   The --passcode flag causes main.c to set opts->keyset->has_passcode=1 with
- *   a zero passcode. This makes keymgr derive the image_key via:
- *     HMAC-SHA256(content_id + passcode)
- *   instead of RSA-decrypting the EKPFS blob (which requires retail_ekpfs_key
- *   or fake_ekpfs_key to be correct for that specific PKG signing).
- *
- *   IMPORTANT: The CLI leaves the keyset NULL in its FIRST callback and lets
- *   pkg_alloc() handle keyset creation through its normal path (lines 1101-1114
- *   of pkg.c). The passcode is only applied in the SECOND callback. We must
- *   mirror this exact flow — setting the keyset prematurely in the first
- *   callback bypasses pkg_alloc's keyset-setup logic and can cause subtle
- *   key-derivation failures.
+ * Adds:
+ *   - pkg_ios_list_files()        : enumerate PKG contents without writing
+ *   - pkg_ios_extract_filtered()  : extract only a caller-supplied list of paths
  */
 
 #include "pkg_ios_wrapper.h"
@@ -69,11 +55,6 @@ void pkg_ios_log_warning(const char* message) {
     if (cur > 0) { strncat(g_pkg_warn_log, "\n", rem); rem--; }
     strncat(g_pkg_warn_log, message, rem);
 }
-
-/* ------------------------------------------------------------------ */
-/* DIAG() — logs to stderr AND the warning-log buffer so diagnostic   */
-/* text appears in both the Xcode console and the UI error view.      */
-/* ------------------------------------------------------------------ */
 
 static void _diag(const char* fmt, ...) __attribute__((format(printf, 1, 2)));
 static void _diag(const char* fmt, ...) {
@@ -129,105 +110,33 @@ const char* pkg_ios_last_error(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* PFS options callback — mirrors --passcode 000...000 from main.c    */
+/* PFS options callback (mirrors --passcode 000...000 from main.c)    */
 /* ------------------------------------------------------------------ */
-/*
- * pkg.c calls this callback TWICE:
- *
- *   1st call (pfs_opts.keyset == NULL):
- *     Do NOT touch keyset. Return immediately so pkg_alloc runs its
- *     normal keyset-creation path (lines 1101-1114): look up the title
- *     keyset from config.ini -> if not found, allocate one with the real
- *     content_id and attempt EKPFS decryption (fails gracefully for
- *     fpkgs). This is exactly what the CLI does.
- *
- *   2nd call (pfs_opts.keyset != NULL):
- *     Apply the zero passcode to the keyset, just like the CLI's
- *     --passcode flag does in tweak_pfs_options(). has_passcode takes
- *     priority in keymgr_generate_keys_for_title_keyset, so this
- *     overrides any EKPFS-derived image_key — matching CLI behaviour.
- */
+
 static int s_callback_count = 0;
 
 static int ios_set_pfs_options(void* arg, struct pkg* pkg, struct pfs_options* opts) {
     UNUSED(arg);
-
     s_callback_count++;
 
     DIAG("=== ios_set_pfs_options CALL #%d ===", s_callback_count);
-    DIAG("  pkg=%p  pkg->hdr=%p", (void*)pkg, pkg ? (void*)pkg->hdr : NULL);
-    DIAG("  opts->keyset=%p  finalized=%d  skip_keygen=%d",
-         (void*)opts->keyset, opts->finalized, opts->skip_keygen);
-    DIAG("  skip_sig=%d  skip_block_hash=%d",
-         opts->skip_signature_check, opts->skip_block_hash_check);
-
-    if (opts->content_id)
-        DIAG("  opts->content_id = \"%s\"", opts->content_id);
-    else
-        DIAG("  opts->content_id = NULL");
-
-    if (pkg && pkg->hdr)
-        DIAG("  pkg content_id = \"%s\"  pkg->finalized = %d",
-             pkg->hdr->content_id, pkg->finalized);
+    DIAG("  pkg=%p  opts->keyset=%p", (void*)pkg, (void*)opts->keyset);
 
     if (opts->keyset) {
-        DIAG("  keyset->content_id = \"%s\"", opts->keyset->content_id);
-        DIAG("  flags BEFORE: passcode=%d image_key=%d enc_data=%d enc_tweak=%d sig_hmac=%d",
-             opts->keyset->flags.has_passcode, opts->keyset->flags.has_image_key,
-             opts->keyset->flags.has_enc_data_key, opts->keyset->flags.has_enc_tweak_key,
-             opts->keyset->flags.has_sig_hmac_key);
-
-        /* ── Second call: apply zero passcode (mirrors CLI --passcode) ── */
         memset(opts->keyset->passcode, '0', sizeof(opts->keyset->passcode));
         opts->keyset->flags.has_passcode = 1;
-
-        DIAG("  -> Applied zero passcode (32x ASCII '0' = 0x30)");
-        DIAG("  flags AFTER:  passcode=%d image_key=%d enc_data=%d enc_tweak=%d sig_hmac=%d",
-             opts->keyset->flags.has_passcode, opts->keyset->flags.has_image_key,
-             opts->keyset->flags.has_enc_data_key, opts->keyset->flags.has_enc_tweak_key,
-             opts->keyset->flags.has_sig_hmac_key);
-
-        /* Verify passcode bytes are really 0x30 */
-        DIAG("  passcode[0..3] = 0x%02X 0x%02X 0x%02X 0x%02X (expect 0x30)",
-             (unsigned char)opts->keyset->passcode[0],
-             (unsigned char)opts->keyset->passcode[1],
-             (unsigned char)opts->keyset->passcode[2],
-             (unsigned char)opts->keyset->passcode[3]);
+        DIAG("  -> Applied zero passcode");
     } else {
         DIAG("  keyset is NULL -> leaving for pkg_alloc to create");
     }
 
-    /* Always relax checks */
     opts->skip_signature_check  = 1;
     opts->skip_block_hash_check = 1;
-
-    DIAG("  -> Set skip_signature_check=1  skip_block_hash_check=1");
-    DIAG("=== END CALL #%d ===", s_callback_count);
-
     return 1;
 }
 
 /* ------------------------------------------------------------------ */
-/* Progress callback shim                                             */
-/* ------------------------------------------------------------------ */
-
-struct ios_cb_ctx {
-    pkg_ios_progress_cb cb;
-    void*               user_ctx;
-};
-
-static enum cb_result ios_unpack_pre_cb(void* arg, const char* path,
-                                         enum pfs_entry_type type, int* needed) {
-    UNUSED(type);
-    *needed = 1;
-    struct ios_cb_ctx* ctx = (struct ios_cb_ctx*)arg;
-    if (ctx && ctx->cb && path)
-        ctx->cb(ctx->user_ctx, path);
-    return CB_RESULT_CONTINUE;
-}
-
-/* ------------------------------------------------------------------ */
-/* mkdir -p                                                           */
+/* mkdir -p                                                            */
 /* ------------------------------------------------------------------ */
 
 static void mkdir_p(const char* path) {
@@ -243,7 +152,7 @@ static void mkdir_p(const char* path) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Quick PKG header peek (magic + content_id only)                   */
+/* Quick PKG header peek (magic + content_id only)                    */
 /* ------------------------------------------------------------------ */
 
 static const uint8_t PKG_MAGIC[4] = { 0x7f, 0x43, 0x4e, 0x54 };
@@ -274,51 +183,18 @@ static int read_pkg_content_id(const char* pkg_path, char out_id[PKG_CONTENT_ID_
 }
 
 /* ------------------------------------------------------------------ */
-/* Main extraction entry point                                        */
+/* Shared PKG open / teardown helper                                  */
 /* ------------------------------------------------------------------ */
 
-int pkg_ios_extract(
-    const char*         pkg_path,
-    const char*         output_dir,
-    const char*         config_path,
-    pkg_ios_progress_cb progress_cb,
-    void*               cb_ctx
-) {
-    struct pkg*       pkg = NULL;
-    struct ios_cb_ctx ctx;
-    int ret = -1;
-
-    if (!pkg_path || !output_dir || !config_path) {
-        set_error("NULL argument passed to pkg_ios_extract");
-        return -1;
-    }
-
-    /* Reset warning log + callback counter.
-     * DIAG() calls after this point are captured and shown in the UI. */
-    g_pkg_warn_log[0] = '\0';
-    s_callback_count = 0;
-
-    DIAG("========== pkg_ios_extract BEGIN ==========");
-    DIAG("pkg_path    = %s", pkg_path);
-    DIAG("output_dir  = %s", output_dir);
-    DIAG("config_path = %s", config_path);
-
-    /* Log file sizes */
-    {
-        struct stat st;
-        if (stat(pkg_path, &st) == 0)
-            DIAG("PKG file size = %lld bytes (%.1f MB)",
-                 (long long)st.st_size, (double)st.st_size / (1024.0 * 1024.0));
-        else
-            DIAG("!! PKG stat FAILED: errno=%d (%s)", errno, strerror(errno));
-
-        if (stat(config_path, &st) == 0)
-            DIAG("config.ini size = %lld bytes", (long long)st.st_size);
-        else
-            DIAG("!! config.ini stat FAILED: errno=%d (%s)", errno, strerror(errno));
-    }
-
-    /* Quick sanity check on PKG magic */
+/*
+ * Opens and initialises a PKG for enumeration or extraction.
+ * On success, *pkg_out points to the allocated pkg.
+ * On failure, returns -1 and sets the last-error string.
+ * The caller must call pkg_free() + keymgr_finalize() + crypto_finalize()
+ * when done.
+ */
+static int pkg_open(const char* pkg_path, const char* config_path,
+                    struct pkg** pkg_out) {
     char content_id[PKG_CONTENT_ID_MAX + 1] = { 0 };
     if (!read_pkg_content_id(pkg_path, content_id)) {
         char errbuf[512];
@@ -329,28 +205,125 @@ int pkg_ios_extract(
         append_warn_log_to_error();
         return -1;
     }
-    DIAG("PKG content_id = \"%s\" (len=%zu)", content_id, strlen(content_id));
+    DIAG("PKG content_id = \"%s\"", content_id);
 
-    /* Dump first 16 bytes of PKG as hex */
-    {
-        FILE* f = fopen(pkg_path, "rb");
-        if (f) {
-            uint8_t hdr[16];
-            size_t n = fread(hdr, 1, 16, f);
-            fclose(f);
-            char hex[16*3+1]; hex[0] = '\0';
-            for (size_t i = 0; i < n; i++) {
-                char tmp[4];
-                snprintf(tmp, sizeof(tmp), "%s%02X", i ? " " : "", hdr[i]);
-                strncat(hex, tmp, sizeof(hex) - strlen(hex) - 1);
-            }
-            DIAG("PKG header: %s", hex);
-        }
+    if (!crypto_initialize()) {
+        set_error("crypto_initialize failed.");
+        append_warn_log_to_error();
+        return -1;
+    }
+    if (!keymgr_initialize(config_path)) {
+        set_error("keymgr_initialize failed.");
+        append_warn_log_to_error();
+        crypto_finalize();
+        return -1;
     }
 
-    mkdir_p(output_dir);
+    *pkg_out = pkg_alloc(pkg_path, ios_set_pfs_options, NULL);
+    if (!*pkg_out) {
+        char errbuf[2048];
+        snprintf(errbuf, sizeof(errbuf),
+                 "pkg_alloc failed for: %s\n"
+                 "Possible causes: wrong passcode, missing keys, corrupt PKG.",
+                 content_id[0] ? content_id : "(unknown)");
+        set_error(errbuf);
+        append_warn_log_to_error();
+        keymgr_finalize();
+        crypto_finalize();
+        return -1;
+    }
 
-    /* Arm longjmp so error() in the C library doesn't exit() the app */
+    if (!(*pkg_out)->inner_pfs) {
+        set_error("PKG has no inner PFS image.\n"
+                  "This may be a DLC-data-only or outer-content-only PKG.");
+        append_warn_log_to_error();
+        pkg_free(*pkg_out);
+        *pkg_out = NULL;
+        keymgr_finalize();
+        crypto_finalize();
+        return -1;
+    }
+
+    return 0;
+}
+
+/* ------------------------------------------------------------------ */
+/* Progress / filter callback context                                 */
+/* ------------------------------------------------------------------ */
+
+struct ios_extract_ctx {
+    pkg_ios_progress_cb  progress_cb;
+    void*                user_ctx;
+    /* filter — NULL means "extract all" */
+    const char* const*   filter_paths;
+    int                  filter_count;
+};
+
+/* Used for extraction: honours filter and calls progress. */
+static enum cb_result ios_unpack_pre_cb(void* arg, const char* path,
+                                        enum pfs_entry_type type, int* needed) {
+    UNUSED(type);
+    struct ios_extract_ctx* ctx = (struct ios_extract_ctx*)arg;
+
+    /* Apply filter */
+    if (ctx && ctx->filter_paths && ctx->filter_count > 0) {
+        int allowed = 0;
+        for (int i = 0; i < ctx->filter_count; i++) {
+            if (ctx->filter_paths[i] && strcmp(ctx->filter_paths[i], path) == 0) {
+                allowed = 1;
+                break;
+            }
+        }
+        *needed = allowed;
+    } else {
+        *needed = 1;   /* no filter — extract everything */
+    }
+
+    /* Report to Swift even when skipping, so progress bar stays alive */
+    if (*needed && ctx && ctx->progress_cb && path)
+        ctx->progress_cb(ctx->user_ctx, path);
+
+    return CB_RESULT_CONTINUE;
+}
+
+/* Used for listing only: never write, just fire the callback. */
+static enum cb_result ios_list_pre_cb(void* arg, const char* path,
+                                      enum pfs_entry_type type, int* needed) {
+    UNUSED(type);
+    *needed = 0;   /* do NOT write anything */
+    struct ios_extract_ctx* ctx = (struct ios_extract_ctx*)arg;
+    if (ctx && ctx->progress_cb && path)
+        ctx->progress_cb(ctx->user_ctx, path);
+    return CB_RESULT_CONTINUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* Internal core that does the actual work                             */
+/* ------------------------------------------------------------------ */
+
+static int pkg_ios_run(
+    const char*          pkg_path,
+    const char*          output_dir,      /* NULL for list-only */
+    const char*          config_path,
+    const char* const*   filter_paths,
+    int                  filter_count,
+    pkg_ios_progress_cb  progress_cb,
+    void*                cb_ctx,
+    int                  list_only
+) {
+    struct pkg* pkg = NULL;
+    int ret = -1;
+
+    if (!pkg_path || !config_path || (!list_only && !output_dir)) {
+        set_error("NULL argument passed to pkg_ios_run");
+        return -1;
+    }
+
+    g_pkg_warn_log[0] = '\0';
+    s_callback_count  = 0;
+
+    DIAG("========== pkg_ios_run BEGIN (list_only=%d) ==========", list_only);
+
     g_pkg_abort_active = 1;
     g_pkg_abort_msg[0] = '\0';
 
@@ -359,8 +332,6 @@ int pkg_ios_extract(
         snprintf(errbuf, sizeof(errbuf), "%s",
                  g_pkg_abort_msg[0] ? g_pkg_abort_msg : "extraction failed");
         set_error(errbuf);
-        DIAG("!! longjmp caught — error() called from C library");
-        DIAG("!! abort msg: %s", g_pkg_abort_msg);
         append_warn_log_to_error();
         if (pkg) { pkg_free(pkg); pkg = NULL; }
         keymgr_finalize();
@@ -369,101 +340,60 @@ int pkg_ios_extract(
         return -1;
     }
 
-    /* Initialize mbedtls crypto (SHA-256 context, AES, RNG).
-     * WITHOUT THIS CALL, s_sha256_md_info is NULL and every
-     * sha256_buffer / hmac_sha256_buffer silently produces garbage. */
-    if (!crypto_initialize()) {
-        set_error("crypto_initialize failed — mbedtls could not start.\n"
-                  "SHA-256, HMAC, and AES will not work.");
-        DIAG("!! crypto_initialize FAILED");
-        append_warn_log_to_error();
-        goto done;
+    if (pkg_open(pkg_path, config_path, &pkg) != 0) {
+        g_pkg_abort_active = 0;
+        return -1;
     }
-    DIAG("crypto_initialize OK");
 
-    /* Load global keys from config.ini */
-    DIAG("Calling keymgr_initialize...");
-    if (!keymgr_initialize(config_path)) {
-        set_error("keymgr_initialize failed.\n"
-                  "config.ini may be missing, unreadable, or lack required global keys.\n"
-                  "Make sure config.ini is in the app's Documents folder.");
-        DIAG("!! keymgr_initialize FAILED");
-        append_warn_log_to_error();
-        goto done;
-    }
-    DIAG("keymgr_initialize OK");
+    struct ios_extract_ctx ctx;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.progress_cb  = progress_cb;
+    ctx.user_ctx     = cb_ctx;
+    ctx.filter_paths = filter_paths;
+    ctx.filter_count = filter_count;
 
-    /* Check if config.ini had a title keyset for this content_id */
-    {
-        struct keymgr_title_keyset* pre = keymgr_get_title_keyset(content_id);
-        if (pre) {
-            DIAG("config.ini HAS keyset for \"%s\"", content_id);
-            DIAG("  passcode=%d image_key=%d enc_data=%d enc_tweak=%d sig_hmac=%d",
-                 pre->flags.has_passcode, pre->flags.has_image_key,
-                 pre->flags.has_enc_data_key, pre->flags.has_enc_tweak_key,
-                 pre->flags.has_sig_hmac_key);
-            if (pre->flags.has_passcode) {
-                DIAG("  passcode[0..3] = 0x%02X 0x%02X 0x%02X 0x%02X",
-                     (unsigned char)pre->passcode[0], (unsigned char)pre->passcode[1],
-                     (unsigned char)pre->passcode[2], (unsigned char)pre->passcode[3]);
-            }
+    if (list_only) {
+        /* Enumerate without writing — pass a temp dir that we never actually use */
+        char tmp_dir[] = "/tmp/pkg_ios_list_XXXXXX";
+        char* td = mkdtemp(tmp_dir);
+        const char* enum_dir = td ? td : "/tmp";
+
+        char image0[4096];
+        snprintf(image0, sizeof(image0), "%s/Image0", enum_dir);
+        /* mkdir will silently fail or succeed — we don't care */
+        mkdir_p(image0);
+
+        int ok = pfs_unpack_all(pkg->inner_pfs, image0, ios_list_pre_cb, &ctx);
+        if (!ok) {
+            set_error("pfs_unpack_all failed during file listing.");
+            append_warn_log_to_error();
         } else {
-            DIAG("config.ini has NO keyset for \"%s\"", content_id);
+            ret = 0;
+        }
+
+        /* Clean up temp dir (best-effort) */
+        if (td) {
+            rmdir(image0);
+            rmdir(td);
+        }
+    } else {
+        char image0[4096];
+        snprintf(image0, sizeof(image0), "%s/Image0", output_dir);
+        mkdir_p(output_dir);
+        mkdir_p(image0);
+
+        DIAG("pfs_unpack_all -> %s", image0);
+        if (!pfs_unpack_all(pkg->inner_pfs, image0, ios_unpack_pre_cb, &ctx)) {
+            set_error("pfs_unpack_all failed — PKG data may be corrupt or incomplete.");
+            append_warn_log_to_error();
+        } else {
+            DIAG("pfs_unpack_all OK");
+            ret = 0;
         }
     }
 
-    /* Open and decrypt the PKG */
-    DIAG("Calling pkg_alloc()...");
-    pkg = pkg_alloc(pkg_path, ios_set_pfs_options, NULL);
-    DIAG("pkg_alloc returned: %p  (callback called %d times)", (void*)pkg, s_callback_count);
-
-    if (!pkg) {
-        char errbuf[2048];
-        snprintf(errbuf, sizeof(errbuf),
-                 "pkg_alloc failed for: %s\n\n"
-                 "Possible causes:\n"
-                 "- The zero passcode doesn't match this PKG\n"
-                 "- config.ini missing fake_ekpfs_key / debug_ekpfs_key\n"
-                 "- PKG file corrupt or truncated\n"
-                 "- mmap() failed\n"
-                 "See diagnostics below for details.",
-                 content_id[0] ? content_id : "(unknown)");
-        set_error(errbuf);
-        append_warn_log_to_error();
-        goto done;
-    }
-
-    DIAG("pkg_alloc OK: pfs=%p  inner_pfs=%p", (void*)pkg->pfs, (void*)pkg->inner_pfs);
-
-    if (!pkg->inner_pfs) {
-        set_error("PKG has no inner PFS image.\n"
-                  "This may be a DLC-data-only or outer-content-only PKG.");
-        append_warn_log_to_error();
-        goto done;
-    }
-
-    /* Extract */
-    memset(&ctx, 0, sizeof(ctx));
-    ctx.cb       = progress_cb;
-    ctx.user_ctx = cb_ctx;
-
-    char image0[4096];
-    snprintf(image0, sizeof(image0), "%s/Image0", output_dir);
-    mkdir_p(image0);
-
-    DIAG("Calling pfs_unpack_all -> %s", image0);
-    if (!pfs_unpack_all(pkg->inner_pfs, image0, ios_unpack_pre_cb, &ctx)) {
-        set_error("pfs_unpack_all failed — PKG data may be corrupt or incomplete.");
-        append_warn_log_to_error();
-        goto done;
-    }
-
-    DIAG("pfs_unpack_all OK — extraction complete!");
-    ret = 0;
-
-done:
-    DIAG("========== pkg_ios_extract END (ret=%d) ==========", ret);
-    if (pkg) pkg_free(pkg);
+    DIAG("========== pkg_ios_run END (ret=%d) ==========", ret);
+    pkg_free(pkg);
     keymgr_finalize();
     crypto_finalize();
     g_pkg_abort_active = 0;
@@ -471,7 +401,45 @@ done:
 }
 
 /* ------------------------------------------------------------------ */
-/* Read content_id without full extraction (for UI display)           */
+/* Public API                                                          */
+/* ------------------------------------------------------------------ */
+
+int pkg_ios_extract(
+    const char*          pkg_path,
+    const char*          output_dir,
+    const char*          config_path,
+    pkg_ios_progress_cb  progress_cb,
+    void*                cb_ctx
+) {
+    return pkg_ios_run(pkg_path, output_dir, config_path,
+                       NULL, 0, progress_cb, cb_ctx, 0);
+}
+
+int pkg_ios_extract_filtered(
+    const char*          pkg_path,
+    const char*          output_dir,
+    const char*          config_path,
+    const char* const*   filter_paths,
+    int                  filter_count,
+    pkg_ios_progress_cb  progress_cb,
+    void*                cb_ctx
+) {
+    return pkg_ios_run(pkg_path, output_dir, config_path,
+                       filter_paths, filter_count, progress_cb, cb_ctx, 0);
+}
+
+int pkg_ios_list_files(
+    const char*          pkg_path,
+    const char*          config_path,
+    pkg_ios_progress_cb  list_cb,
+    void*                cb_ctx
+) {
+    return pkg_ios_run(pkg_path, NULL, config_path,
+                       NULL, 0, list_cb, cb_ctx, 1);
+}
+
+/* ------------------------------------------------------------------ */
+/* Read content_id without full decryption (for UI display)           */
 /* ------------------------------------------------------------------ */
 
 int pkg_ios_read_content_id(const char* pkg_path, char* out_buf, int buf_size) {
