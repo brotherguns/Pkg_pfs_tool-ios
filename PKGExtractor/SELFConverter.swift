@@ -37,11 +37,17 @@ private func readLE32(_ data: Data, at offset: Int) -> UInt32 {
     (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
 }
 
+// FIX 1: broken into two sub-expressions so the Swift type-checker doesn't time out
 private func readLE64(_ data: Data, at offset: Int) -> UInt64 {
-    UInt64(data[offset])       | (UInt64(data[offset + 1]) << 8)  |
-    (UInt64(data[offset + 2]) << 16) | (UInt64(data[offset + 3]) << 24) |
-    (UInt64(data[offset + 4]) << 32) | (UInt64(data[offset + 5]) << 40) |
-    (UInt64(data[offset + 6]) << 48) | (UInt64(data[offset + 7]) << 56)
+    let lo = UInt64(data[offset])
+            | (UInt64(data[offset + 1]) << 8)
+            | (UInt64(data[offset + 2]) << 16)
+            | (UInt64(data[offset + 3]) << 24)
+    let hi = UInt64(data[offset + 4]) << 32
+            | (UInt64(data[offset + 5]) << 40)
+            | (UInt64(data[offset + 6]) << 48)
+            | (UInt64(data[offset + 7]) << 56)
+    return lo | hi
 }
 
 // MARK: – Main converter
@@ -153,8 +159,10 @@ struct SELFConverter {
         // We use NSMutableData so we can seek (overwrite at arbitrary offsets).
         let output = NSMutableData()
 
-        func appendData(_ d: DataProtocol) {
-            output.append(contentsOf: d)
+        // FIX 2 & 3: use 'any DataProtocol' and NSMutableData.append(_:Data) instead
+        //            of the non-existent append(contentsOf:) overload
+        func appendData(_ d: any DataProtocol) {
+            output.append(Data(d))
         }
 
         // Write ELF identity + extension header
