@@ -138,7 +138,7 @@ class ExtractionManager: ObservableObject {
                 let cStringPtrs: [UnsafeMutablePointer<CChar>?] = filter.map { strdup($0) }
                 defer { cStringPtrs.forEach { if let p = $0 { free(p) } } }
 
-                let constPtrs: [UnsafePointer<CChar>?] = cStringPtrs.map { $0.map(UnsafePointer.init) }
+                let constPtrs: [UnsafePointer<CChar>?] = cStringPtrs.map { ptr in ptr.map { UnsafePointer($0) } }
                 result = constPtrs.withUnsafeBufferPointer { buf in
                     pkg_ios_extract_filtered(
                         pkgPath,
