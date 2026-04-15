@@ -262,11 +262,22 @@ struct ios_extract_ctx {
 /* Used for extraction: honours filter and calls progress. */
 static enum cb_result ios_unpack_pre_cb(void* arg, const char* path,
                                         enum pfs_entry_type type, int* needed) {
-    UNUSED(type);
     struct ios_extract_ctx* ctx = (struct ios_extract_ctx*)arg;
 
-    /* Apply filter */
     if (ctx && ctx->filter_paths && ctx->filter_count > 0) {
+        if (type == PFS_ENTRY_DIRECTORY) {
+            /*
+             * Always recurse into directories when a filter is active.
+             * pfs_unpack_cb skips recursion entirely when *needed == 0, so
+             * setting it to 0 here would hide every file inside — even ones
+             * that match the filter.  We must descend the whole tree and let
+             * the file-level check below decide what actually gets written.
+             */
+            *needed = 1;
+            return CB_RESULT_CONTINUE;
+        }
+
+        /* For regular files: only extract if the path is in the filter. */
         int allowed = 0;
         for (int i = 0; i < ctx->filter_count; i++) {
             if (ctx->filter_paths[i] && strcmp(ctx->filter_paths[i], path) == 0) {
@@ -279,8 +290,8 @@ static enum cb_result ios_unpack_pre_cb(void* arg, const char* path,
         *needed = 1;   /* no filter — extract everything */
     }
 
-    /* Report to Swift even when skipping, so progress bar stays alive */
-    if (*needed && ctx && ctx->progress_cb && path)
+    /* Report progress to Swift for files being extracted. */
+    if (*needed && type != PFS_ENTRY_DIRECTORY && ctx && ctx->progress_cb && path)
         ctx->progress_cb(ctx->user_ctx, path);
 
     return CB_RESULT_CONTINUE;
