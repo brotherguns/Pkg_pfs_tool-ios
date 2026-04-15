@@ -125,10 +125,16 @@ class ExtractionManager: ObservableObject {
             let result: Int32
 
             if let filter = filterList, !filter.isEmpty {
-                // Filtered extraction via pkg_ios_extract_filtered
-                let cStrings: [UnsafePointer<CChar>?] = filter.map { str in
-                    (str as NSString).utf8String
-                }
+                // Filtered extraction via pkg_ios_extract_filtered.
+                //
+                // IMPORTANT: (str as NSString).utf8String returns a pointer into
+                // the NSString's internal buffer.  If the NSString is a temporary
+                // it can be ARC-released before withUnsafeBufferPointer runs,
+                // leaving dangling pointers and causing a crash.  We keep a
+                // strong reference to every NSString for the full duration of the
+                // C call by storing them in `nsStrings` first.
+                let nsStrings = filter.map { $0 as NSString }
+                let cStrings: [UnsafePointer<CChar>?] = nsStrings.map { $0.utf8String }
                 result = cStrings.withUnsafeBufferPointer { buf in
                     pkg_ios_extract_filtered(
                         pkgPath,
@@ -148,6 +154,9 @@ class ExtractionManager: ObservableObject {
                         selfPtr
                     )
                 }
+                // Explicit withExtendedLifetime keeps the compiler from
+                // releasing nsStrings before withUnsafeBufferPointer returns.
+                withExtendedLifetime(nsStrings) {}
             } else {
                 // Extract everything
                 result = pkg_ios_extract(
