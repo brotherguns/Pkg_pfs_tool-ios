@@ -127,15 +127,19 @@ class ExtractionManager: ObservableObject {
             if let filter = filterList, !filter.isEmpty {
                 // Filtered extraction via pkg_ios_extract_filtered.
                 //
-                // IMPORTANT: (str as NSString).utf8String returns a pointer into
-                // the NSString's internal buffer.  If the NSString is a temporary
-                // it can be ARC-released before withUnsafeBufferPointer runs,
-                // leaving dangling pointers and causing a crash.  We keep a
-                // strong reference to every NSString for the full duration of the
-                // C call by storing them in `nsStrings` first.
-                let nsStrings = filter.map { $0 as NSString }
-                let cStrings: [UnsafePointer<CChar>?] = nsStrings.map { $0.utf8String }
-                result = cStrings.withUnsafeBufferPointer { buf in
+                // NSString.utf8String returns a pointer backed by an autorelease-pool
+                // buffer — NOT the NSString's own storage.  The pool can drain at any
+                // Swift statement boundary on the cooperative scheduler, leaving a
+                // dangling pointer that crashes strcmp in C.  Even keeping NSString
+                // objects alive is therefore not sufficient.
+                //
+                // Fix: strdup() each path into an independent heap allocation.
+                // The defer frees them after pkg_ios_extract_filtered returns.
+                let cStringPtrs: [UnsafeMutablePointer<CChar>?] = filter.map { strdup($0) }
+                defer { cStringPtrs.forEach { if let p = $0 { free(p) } } }
+
+                let constPtrs: [UnsafePointer<CChar>?] = cStringPtrs.map { $0.map(UnsafePointer.init) }
+                result = constPtrs.withUnsafeBufferPointer { buf in
                     pkg_ios_extract_filtered(
                         pkgPath,
                         outPath,
@@ -154,9 +158,6 @@ class ExtractionManager: ObservableObject {
                         selfPtr
                     )
                 }
-                // Explicit withExtendedLifetime keeps the compiler from
-                // releasing nsStrings before withUnsafeBufferPointer returns.
-                withExtendedLifetime(nsStrings) {}
             } else {
                 // Extract everything
                 result = pkg_ios_extract(
