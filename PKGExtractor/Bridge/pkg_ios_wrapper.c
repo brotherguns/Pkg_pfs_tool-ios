@@ -286,11 +286,18 @@ static enum cb_result ios_unpack_pre_cb(void* arg, const char* path,
     return CB_RESULT_CONTINUE;
 }
 
-/* Used for listing only: never write, just fire the callback. */
+/* Used for listing only: never write files, but DO recurse into directories. */
 static enum cb_result ios_list_pre_cb(void* arg, const char* path,
                                       enum pfs_entry_type type, int* needed) {
-    UNUSED(type);
-    *needed = 0;   /* do NOT write anything */
+    /*
+     * For DIRECTORY entries, needed=1 tells pfs_unpack_cb to call
+     * pfs_parse_dir_entries() and descend into the folder.
+     * For FILE entries, needed=0 skips the actual disk write.
+     * Without this distinction, *needed=0 on every directory causes
+     * pfs_unpack_cb to `goto done` before recursing, so only the
+     * root-level entries are ever reported.
+     */
+    *needed = (type == PFS_ENTRY_DIRECTORY) ? 1 : 0;
     struct ios_extract_ctx* ctx = (struct ios_extract_ctx*)arg;
     if (ctx && ctx->progress_cb && path)
         ctx->progress_cb(ctx->user_ctx, path);
