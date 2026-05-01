@@ -88,6 +88,9 @@ struct prefetch_state {
 /* Producer thread: reads the next chunk into the non-current slot. */
 static void* prefetch_thread(void* arg) {
     struct prefetch_state* ps = (struct prefetch_state*)arg;
+    uint64_t size_left;
+    size_t   cur_size;
+    int      ok;
 
     pthread_mutex_lock(&ps->mtx);
 
@@ -100,24 +103,22 @@ static void* prefetch_thread(void* arg) {
             break;
 
         if (ps->next_offset >= ps->total_size) {
-            ps->done = 1;
+            ps->done  = 1;
             ps->ready = 1;                   /* wake consumer so it exits */
             pthread_cond_signal(&ps->cond_ready);
             break;
         }
 
-        uint64_t size_left  = ps->total_size - ps->next_offset;
-        size_t   cur_size   = (size_left > CHUNK_SIZE)
-                              ? CHUNK_SIZE
-                              : (size_t)size_left;
+        size_left = ps->total_size - ps->next_offset;
+        cur_size  = (size_left > CHUNK_SIZE) ? CHUNK_SIZE : (size_t)size_left;
 
         pthread_mutex_unlock(&ps->mtx);
 
         /* Read outside the lock — this is the expensive mmap/decrypt step */
-        int ok = pfs_file_read(ps->file,
-                               ps->next_offset,
-                               ps->buf[ps->fill_idx],
-                               cur_size);
+        ok = pfs_file_read(ps->file,
+                           ps->next_offset,
+                           ps->buf[ps->fill_idx],
+                           cur_size);
 
         pthread_mutex_lock(&ps->mtx);
 
@@ -827,25 +828,23 @@ void pfs_free_file(struct pfs_file_context* file) {
  *   Opt-4  F_NOCACHE + ftruncate on the output fd (Apple-only via #if)
  */
 int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_directory, pfs_unpack_pre_cb pre_cb, void* pre_cb_arg) {
+    /* All declarations at top — required for C89 strict mode (Xcode default) */
     struct pfs_file_context* file = NULL;
+    struct prefetch_state ps;
+    pthread_t prefetch_tid;
     char file_path[PATH_MAX];
     char directory[PATH_MAX];
-
     pfs_ino ino;
     enum pfs_entry_type entry_type;
+    enum cb_result ret;
+    int fd = -1;
+    int needed;
+    int status = 0;
+    int thread_started = 0;
+    int consume_idx = 0;
 #ifdef DONT_UNPACK_IF_EXISTS
     size_t existing_file_size;
 #endif
-    int fd = -1;
-    int needed;
-    enum cb_result ret;
-    int status = 0;
-
-    /* ── Opt-3: ping-pong state (stack-allocated, zero-init) ── */
-    struct prefetch_state ps;
-    pthread_t prefetch_tid;
-    int thread_started = 0;
-    int consume_idx    = 0;    /* slot the main thread is currently reading  */
 
     assert(pfs != NULL);
     assert(path != NULL);
@@ -932,24 +931,26 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
      * the second chunk.
      */
     {
-        uint64_t first_size = (file->file_size > CHUNK_SIZE)
-                              ? CHUNK_SIZE
-                              : (size_t)file->file_size;
+        /* first_size declared at block top for C89 compatibility */
+        uint64_t first_size;
+        first_size = (file->file_size > (uint64_t)CHUNK_SIZE)
+                     ? (uint64_t)CHUNK_SIZE
+                     : file->file_size;
 
         if (first_size > 0) {
             if (!pfs_file_read(file, 0, ps.buf[0], (size_t)first_size))
                 goto error;
         }
-        ps.filled[0]  = (size_t)first_size;
+        ps.filled[0]   = (size_t)first_size;
         ps.next_offset = first_size;
         ps.total_size  = file->file_size;
         ps.file        = file;
         ps.fill_idx    = 1;  /* producer starts on slot 1 */
         ps.ready       = 0;
 
-        pthread_mutex_init(&ps.mtx,          NULL);
-        pthread_cond_init (&ps.cond_ready,    NULL);
-        pthread_cond_init (&ps.cond_consumed, NULL);
+        pthread_mutex_init(&ps.mtx,           NULL);
+        pthread_cond_init (&ps.cond_ready,     NULL);
+        pthread_cond_init (&ps.cond_consumed,  NULL);
 
         if (pthread_create(&prefetch_tid, NULL, prefetch_thread, &ps) != 0)
             goto error;

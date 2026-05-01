@@ -846,30 +846,48 @@ struct encdec_device* encdec_device_alloc(
         goto error;
     memset(dev->sector_buf, 0, sector_size);
 
-    /* Build combined key: data_key || tweak_key (IEEE 1619 K1 || K2) */
+    /* Build combined key:
+     *   mbedTLS convention  : data_key  || tweak_key  (K1 || K2)
+     *   CommonCrypto kCCModeXTS: tweak_key || data_key (K2 || K1)
+     * We build the mbedTLS layout first (used on non-Apple), then a separate
+     * cc_combined_key in the reversed order for CommonCrypto on Apple.
+     */
     memcpy(combined_key,                data_key,  data_key_size);
     memcpy(combined_key + data_key_size, tweak_key, tweak_key_size);
 
 #if defined(__APPLE__)
     /* ── Apple: create CCCryptorRef pair for hardware AES-XTS ────────────── */
     {
+        /*
+         * CommonCrypto kCCModeXTS key layout is K2 || K1
+         * (tweak key first, then data key) — the reverse of the mbedTLS
+         * combined_key we built above.  Build a separate buffer here so
+         * the mbedTLS path below remains correct.
+         */
+        uint8_t cc_combined_key[32 * 2];
         const size_t combined_len = data_key_size + tweak_key_size;
         uint8_t zero_iv[16];
         CCCryptorStatus cc_status;
 
+        memcpy(cc_combined_key,                 tweak_key, tweak_key_size);
+        memcpy(cc_combined_key + tweak_key_size, data_key,  data_key_size);
         memset(zero_iv, 0, sizeof(zero_iv));
 
         /*
-         * CCCryptorCreateWithMode with kCCModeXTS:
-         *   iv        → initial 16-byte sector tweak (updated per-sector via Reset)
-         *   key       → K1 || K2 (data key followed by tweak key)
-         *   keyLength → combined key length in bytes
+         * CCCryptorCreateWithMode signature (12 args):
+         *   op, mode, alg, padding, iv,
+         *   key, keyLength, tweak, tweakLength,
+         *   numRounds, options, &cryptorRef
+         *
+         * For XTS the "tweak" arg here is unused (we update it per-sector
+         * via CCCryptorReset); pass NULL/0.  iv is the initial sector tweak
+         * and is also overwritten by Reset before first use.
          */
         cc_status = CCCryptorCreateWithMode(
             kCCEncrypt, kCCModeXTS, kCCAlgorithmAES,
             ccNoPadding,
             zero_iv,
-            combined_key, combined_len,
+            cc_combined_key, combined_len,
             /* tweak= */ NULL, /* tweakLength= */ 0,
             /* numRounds= */ 0, /* options= */ 0,
             &dev->enc_ctx);
@@ -882,7 +900,7 @@ struct encdec_device* encdec_device_alloc(
             kCCDecrypt, kCCModeXTS, kCCAlgorithmAES,
             ccNoPadding,
             zero_iv,
-            combined_key, combined_len,
+            cc_combined_key, combined_len,
             /* tweak= */ NULL, /* tweakLength= */ 0,
             /* numRounds= */ 0, /* options= */ 0,
             &dev->dec_ctx);
