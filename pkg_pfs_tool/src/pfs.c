@@ -830,7 +830,7 @@ static enum cb_result pfs_unpack_cb(void* arg, struct pfs* pfs, pfs_ino ino, enu
 			pfs_parse_dir_entries(pfs, data, file->file_size, &pfs_unpack_cb, &new_args);
 		} else if (type == PFS_ENTRY_FILE) {
 			if (!pfs_unpack_single(pfs, file_path, args->output_directory, args->pre_cb, args->pre_cb_arg))
-				error("Unable to unpack PKG file: %s", file_path);
+				warning("Unable to unpack PKG file (skipped): %s", file_path);
 		}
 	}
 
