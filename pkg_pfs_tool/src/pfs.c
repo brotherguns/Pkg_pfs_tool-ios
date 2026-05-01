@@ -4,7 +4,10 @@
 #include "keys.h"
 #include "util.h"
 
-#define CHUNK_SIZE (1024 * 1024)   /* 1 MiB — reduces syscall count ~64x vs old 16 KiB */
+#include <fcntl.h>
+#include <unistd.h>
+
+#define CHUNK_SIZE (4 * 1024 * 1024)   /* 4 MiB — Direct I/O optimized for APFS/NVMe */
 
 #ifndef _DEBUG
 //#	define DONT_UNPACK_IF_EXISTS
@@ -745,6 +748,15 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
 	if (fd < 0)
 		goto error;
 
+	/* Bypass APFS RAM cache — Direct I/O straight to NVMe */
+#if defined(F_NOCACHE)
+	fcntl(fd, F_NOCACHE, 1);
+#endif
+
+	/* Pre-allocate the full file size to avoid fragmentation */
+	if (file->file_size > 0)
+		ftruncate(fd, (off_t)file->file_size);
+
 	/* Tell the kernel we'll write sequentially — allows write coalescing */
 #if defined(F_RDADVISE) || defined(POSIX_FADV_SEQUENTIAL)
 #  if defined(POSIX_FADV_SEQUENTIAL)
@@ -942,6 +954,11 @@ int pfs_dump_to_file(struct pfs* pfs, const char* path, pfs_unpack_pre_cb pre_cb
 	fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_LARGEFILE | O_BINARY, 0644);
 	if (fd < 0)
 		goto error;
+
+	/* Bypass APFS RAM cache — Direct I/O straight to NVMe */
+#if defined(F_NOCACHE)
+	fcntl(fd, F_NOCACHE, 1);
+#endif
 
 	block_size = pfs->basic_block_size;
 	block = (uint8_t*)malloc(block_size);
