@@ -2,7 +2,9 @@
  * crypto.c — pkg_pfs_tool
  *
  * Optimization 1 (Apple AES-XTS acceleration):
- *   On __APPLE__ targets the encdec_device uses CommonCrypto's kCCModeXTS,
+ *   On __APPLE__ targets the encdec_device uses two CommonCrypto kCCModeECB
+ *   contexts to implement IEEE 1619 AES-XTS entirely in hardware, routing
+ *   every sector through the A19's dedicated AES accelerator.
  *   which routes every sector through the A-series dedicated AES hardware
  *   accelerator instead of the mbedTLS software path.
  *   CCCryptorReset() is called once per sector to load the tweak/sector-IV
@@ -29,9 +31,12 @@
 #if defined(__APPLE__)
 #  include <CommonCrypto/CommonCryptor.h>
 /*
- * kCCModeXTS is in the public CommonCrypto API since iOS 5 / macOS 10.7.
- * Key layout for XTS: first half = AES data key, second half = AES tweak key.
- * This matches the mbedTLS convention (combined = data_key || tweak_key).
+ * Two kCCModeECB CCCryptorRefs implement IEEE 1619 XTS on iOS (hardware-accelerated).
+ * We implement IEEE 1619 AES-XTS manually with two kCCModeECB CCCryptorRefs:
+ *   tweak_ctx — AES-ECB(K2): encrypts the sector IV into a tweak T
+ *   data_ctx  — AES-ECB(K1): en/decrypts each 16-byte block after XOR with T
+ * Both contexts dispatch through the A-series hardware AES accelerator.
+ * The GF(2^128) alpha-multiply is done in pure C (bit-shifts + XOR, negligible).
  */
 #endif /* __APPLE__ */
 
@@ -44,8 +49,9 @@ struct encdec_device {
      * 16-byte little-endian sector number before every CCCryptorUpdate() so
      * the hardware sees the correct XTS tweak.
      */
-    CCCryptorRef enc_ctx;
-    CCCryptorRef dec_ctx;
+    CCCryptorRef enc_data_ctx;   /* K1 ECB encrypt          */
+    CCCryptorRef enc_tweak_ctx;  /* K2 ECB encrypt (shared) */
+    CCCryptorRef dec_data_ctx;   /* K1 ECB decrypt          */
 #else
     mbedtls_aes_xts_context enc_ctx;
     mbedtls_aes_xts_context dec_ctx;
@@ -803,7 +809,8 @@ error:
  * AES-XTS encdec_device
  * ═══════════════════════════════════════════════════════════════════════════
  *
- * On Apple targets we use CommonCrypto (kCCModeXTS) so that every sector
+ * On Apple targets we use CommonCrypto (kCCModeECB x2) to implement
+ * IEEE 1619 AES-XTS entirely in hardware on every sector.
  * decryption is dispatched to the A19 Pro hardware AES accelerator instead
  * of the mbedTLS software implementation.
  *
@@ -848,7 +855,7 @@ struct encdec_device* encdec_device_alloc(
 
     /* Build combined key:
      *   mbedTLS convention  : data_key  || tweak_key  (K1 || K2)
-     *   CommonCrypto kCCModeXTS: tweak_key || data_key (K2 || K1)
+ *   CommonCrypto manual XTS (ECB x2): data_key for data_ctx, tweak_key for tweak_ctx
      * We build the mbedTLS layout first (used on non-Apple), then a separate
      * cc_combined_key in the reversed order for CommonCrypto on Apple.
      */
@@ -859,7 +866,6 @@ struct encdec_device* encdec_device_alloc(
     /* ── Apple: create CCCryptorRef pair for hardware AES-XTS ────────────── */
     {
         /*
-         * CommonCrypto kCCModeXTS key layout is K2 || K1
          * (tweak key first, then data key) — the reverse of the mbedTLS
          * combined_key we built above.  Build a separate buffer here so
          * the mbedTLS path below remains correct.
@@ -883,29 +889,39 @@ struct encdec_device* encdec_device_alloc(
          * via CCCryptorReset); pass NULL/0.  iv is the initial sector tweak
          * and is also overwritten by Reset before first use.
          */
-        cc_status = CCCryptorCreateWithMode(
-            kCCEncrypt, kCCModeXTS, kCCAlgorithmAES,
-            ccNoPadding,
-            zero_iv,
-            cc_combined_key, combined_len,
-            /* tweak= */ NULL, /* tweakLength= */ 0,
-            /* numRounds= */ 0, /* options= */ 0,
-            &dev->enc_ctx);
-        if (cc_status != kCCSuccess) {
-            warning("CCCryptorCreateWithMode(encrypt/XTS) failed: %d", (int)cc_status);
+    {
+        /*
+         * Manual IEEE 1619 AES-XTS using two kCCModeECB CCCryptorRefs.
+         *   enc_data_ctx / dec_data_ctx : K1 (data key)
+         *   enc_tweak_ctx               : K2 (tweak key), always kCCEncrypt
+         *
+         * Key sizes: data_key_size == tweak_key_size (validated above).
+         * CCCryptorCreate takes key length in BYTES.
+         */
+        const size_t key_bytes = data_key_size;   /* == tweak_key_size */
+        uint8_t null_iv[16];
+        CCCryptorStatus cc_st;
+
+        memset(null_iv, 0, sizeof(null_iv));
+
+        cc_st = CCCryptorCreate(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode,
+                                data_key,  key_bytes, null_iv, &dev->enc_data_ctx);
+        if (cc_st != kCCSuccess) {
+            warning("CCCryptorCreate(enc_data/ECB) failed: %d", (int)cc_st);
             goto error;
         }
 
-        cc_status = CCCryptorCreateWithMode(
-            kCCDecrypt, kCCModeXTS, kCCAlgorithmAES,
-            ccNoPadding,
-            zero_iv,
-            cc_combined_key, combined_len,
-            /* tweak= */ NULL, /* tweakLength= */ 0,
-            /* numRounds= */ 0, /* options= */ 0,
-            &dev->dec_ctx);
-        if (cc_status != kCCSuccess) {
-            warning("CCCryptorCreateWithMode(decrypt/XTS) failed: %d", (int)cc_status);
+        cc_st = CCCryptorCreate(kCCEncrypt, kCCAlgorithmAES, kCCOptionECBMode,
+                                tweak_key, key_bytes, null_iv, &dev->enc_tweak_ctx);
+        if (cc_st != kCCSuccess) {
+            warning("CCCryptorCreate(enc_tweak/ECB) failed: %d", (int)cc_st);
+            goto error;
+        }
+
+        cc_st = CCCryptorCreate(kCCDecrypt, kCCAlgorithmAES, kCCOptionECBMode,
+                                data_key,  key_bytes, null_iv, &dev->dec_data_ctx);
+        if (cc_st != kCCSuccess) {
+            warning("CCCryptorCreate(dec_data/ECB) failed: %d", (int)cc_st);
             goto error;
         }
     }
@@ -931,8 +947,9 @@ struct encdec_device* encdec_device_alloc(
 error:
     if (dev) {
 #if defined(__APPLE__)
-        if (dev->enc_ctx) CCCryptorRelease(dev->enc_ctx);
-        if (dev->dec_ctx) CCCryptorRelease(dev->dec_ctx);
+        if (dev->enc_data_ctx)  CCCryptorRelease(dev->enc_data_ctx);
+        if (dev->enc_tweak_ctx) CCCryptorRelease(dev->enc_tweak_ctx);
+        if (dev->dec_data_ctx)  CCCryptorRelease(dev->dec_data_ctx);
 #else
         /* mbedTLS contexts were either never initialised or already freed */
 #endif
@@ -948,8 +965,9 @@ void encdec_device_free(struct encdec_device* dev) {
         return;
 
 #if defined(__APPLE__)
-    if (dev->enc_ctx) { CCCryptorRelease(dev->enc_ctx); dev->enc_ctx = NULL; }
-    if (dev->dec_ctx) { CCCryptorRelease(dev->dec_ctx); dev->dec_ctx = NULL; }
+    if (dev->enc_data_ctx)  { CCCryptorRelease(dev->enc_data_ctx);  dev->enc_data_ctx  = NULL; }
+    if (dev->enc_tweak_ctx) { CCCryptorRelease(dev->enc_tweak_ctx); dev->enc_tweak_ctx = NULL; }
+    if (dev->dec_data_ctx)  { CCCryptorRelease(dev->dec_data_ctx);  dev->dec_data_ctx  = NULL; }
 #else
     mbedtls_aes_xts_free(&dev->enc_ctx);
     mbedtls_aes_xts_free(&dev->dec_ctx);
@@ -989,48 +1007,101 @@ encdec_sector_no encdec_device_process(
 #if defined(__APPLE__)
     /* ── Apple: hardware AES-XTS via CommonCrypto ────────────────────────── */
     {
-        CCCryptorRef   cc_ctx = encrypt ? dev->enc_ctx : dev->dec_ctx;
+    /* ── Apple: manual IEEE 1619 AES-XTS via two kCCModeECB CCCryptorRefs ─── */
+    {
+        /*
+         * XTS per-sector algorithm (IEEE 1619):
+         *   1. T = AES_K2(sector_number_le128)        [tweak encryption]
+         *   2. For each 16-byte block j in the sector:
+         *        PP = P_j XOR T
+         *        CC = AES_K1(PP)                      [data encryption]
+         *        C_j = CC XOR T
+         *        T = GF_mult_alpha(T)                 [advance tweak]
+         * Decryption is symmetric with AES_K1^{-1}.
+         *
+         * GF_mult_alpha: left-shift T by 1 bit; if the high bit was set,
+         * XOR the result with 0x87 in the least-significant byte (x^128+x^7+x^2+x+1).
+         */
+        CCCryptorRef   tweak_ctx = dev->enc_tweak_ctx;
+        CCCryptorRef   data_ctx  = encrypt ? dev->enc_data_ctx : dev->dec_data_ctx;
         CCCryptorStatus cc_st;
-        size_t         moved;
+        uint8_t  tweak[16];
+        uint8_t  tmp[16];
+        size_t   moved;
+        size_t   j;
+        int      b;
 
         for (i = start_sector; i < end_sector; ++i) {
+            /* Step 1: encrypt sector number into initial tweak */
             u.iv_index = LE64((uint64_t)i);
-
-            /* Load the sector tweak into the hardware context */
-            cc_st = CCCryptorReset(cc_ctx, u.iv_buf);
-            if (cc_st != kCCSuccess)
-                return start_sector; /* signal error */
-
             moved = 0;
-            cc_st = CCCryptorUpdate(cc_ctx,
-                                     in_cur,  sector_size,
-                                     out_cur, sector_size,
-                                     &moved);
-            if (cc_st != kCCSuccess)
-                return start_sector;
+            cc_st = CCCryptorUpdate(tweak_ctx,
+                                    u.iv_buf, 16,
+                                    tweak,    16,
+                                    &moved);
+            if (cc_st != kCCSuccess) return start_sector;
+
+            /* Step 2: process each 16-byte block of the sector */
+            for (j = 0; j < sector_size; j += 16) {
+                const uint8_t* src_blk = in_cur  + j;
+                uint8_t*       dst_blk = out_cur + j;
+                uint8_t carry;
+
+                /* PP = P XOR T */
+                for (b = 0; b < 16; b++) tmp[b] = src_blk[b] ^ tweak[b];
+
+                /* CC = AES_K1(PP)  or  AES_K1^-1(PP) */
+                moved = 0;
+                cc_st = CCCryptorUpdate(data_ctx,
+                                        tmp, 16,
+                                        tmp, 16,
+                                        &moved);
+                if (cc_st != kCCSuccess) return start_sector;
+
+                /* C = CC XOR T */
+                for (b = 0; b < 16; b++) dst_blk[b] = tmp[b] ^ tweak[b];
+
+                /* T = GF_mult_alpha(T) */
+                carry = (tweak[15] >> 7) & 1;
+                for (b = 15; b > 0; b--)
+                    tweak[b] = (uint8_t)((tweak[b] << 1) | (tweak[b-1] >> 7));
+                tweak[0] = (uint8_t)(tweak[0] << 1);
+                if (carry) tweak[0] ^= 0x87;
+            }
 
             in_cur  += sector_size;
             out_cur += sector_size;
         }
 
-        /* Handle any trailing partial sector (pad to full sector, en/decrypt,
-         * then copy only the valid prefix back) */
+        /* Partial trailing sector (pad, process, copy prefix) */
         if (data_size_left != 0) {
+            uint8_t carry;
+
             memset(sector_buf, 0, sector_size);
             memcpy(sector_buf, in_cur, data_size_left);
 
             u.iv_index = LE64((uint64_t)i);
-            cc_st = CCCryptorReset(cc_ctx, u.iv_buf);
-            if (cc_st != kCCSuccess)
-                return start_sector;
-
             moved = 0;
-            cc_st = CCCryptorUpdate(cc_ctx,
-                                     sector_buf, sector_size,
-                                     sector_buf, sector_size,
-                                     &moved);
-            if (cc_st != kCCSuccess)
-                return start_sector;
+            cc_st = CCCryptorUpdate(tweak_ctx,
+                                    u.iv_buf,   16,
+                                    tweak,      16,
+                                    &moved);
+            if (cc_st != kCCSuccess) return start_sector;
+
+            for (j = 0; j < sector_size; j += 16) {
+                uint8_t* blk = sector_buf + j;
+                for (b = 0; b < 16; b++) blk[b] ^= tweak[b];
+                moved = 0;
+                cc_st = CCCryptorUpdate(data_ctx, blk, 16, blk, 16, &moved);
+                if (cc_st != kCCSuccess) return start_sector;
+                for (b = 0; b < 16; b++) blk[b] ^= tweak[b];
+
+                carry = (tweak[15] >> 7) & 1;
+                for (b = 15; b > 0; b--)
+                    tweak[b] = (uint8_t)((tweak[b] << 1) | (tweak[b-1] >> 7));
+                tweak[0] = (uint8_t)(tweak[0] << 1);
+                if (carry) tweak[0] ^= 0x87;
+            }
 
             memcpy(out_cur, sector_buf, data_size_left);
         }
