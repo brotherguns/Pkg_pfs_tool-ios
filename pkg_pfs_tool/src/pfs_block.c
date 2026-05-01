@@ -341,7 +341,8 @@ int pfs_get_block_no_sino(struct pfs* pfs, const struct pfs_dinode* dinode, uint
 				goto error;
 			}
 
-			error("TODO: 0xFFFFFFFF827D5834");
+			warning("Indirect block resolution not implemented — skipping file (block_counter=%u).", block_counter + 1);
+			goto error;
 		} else {
 			*block_no = LE64(dinode->sdi64.direct_blocks[block_counter].block_no);
 			if (sino)
