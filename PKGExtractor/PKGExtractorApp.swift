@@ -3,6 +3,7 @@ import SwiftUI
 @main
 struct PKGExtractorApp: App {
     init() {
+        CrashLogger.install()
         createDocumentsPlaceholder()
     }
 
@@ -25,6 +26,8 @@ Drop your .pkg files into this folder using the Files app,
 then open PKG Extractor and tap the file to extract it.
 
 Output lands in:  PKGExtractor → Extracted → <pkg-name> → Image0
+
+Crash logs (if any) are written to: PKGExtractor → crash_log.txt
 """
         try? text.write(to: readme, atomically: true, encoding: .utf8)
     }
