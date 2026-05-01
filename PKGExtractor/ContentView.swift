@@ -15,6 +15,10 @@ struct ContentView: View {
     @State private var pkgFiles:      [URL]         = []
     @State private var selectedPKG:   URL?           = nil
 
+    // Crash log viewer
+    @State private var showCrashLog   = false
+    @State private var crashLogText   = ""
+
     // File picker state
     @State private var showFilePicker  = false
     @State private var pickerPKG:      URL?           = nil
@@ -95,6 +99,17 @@ struct ContentView: View {
                         }
                     }
                 }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    if CrashLogger.readLog() != nil {
+                        Button {
+                            crashLogText = CrashLogger.readLog() ?? ""
+                            showCrashLog = true
+                        } label: {
+                            Label("Crash Log", systemImage: "exclamationmark.triangle.fill")
+                                .foregroundColor(.orange)
+                        }
+                    }
+                }
             }
             // ── File picker sheet ──────────────────────────────────────
             .sheet(isPresented: $showFilePicker) {
@@ -111,6 +126,33 @@ struct ContentView: View {
                         showFilePicker = false
                         pickerPKG      = nil
                         selectedPKG    = nil
+                    }
+                }
+            }
+            // ── Crash log sheet ────────────────────────────────────────
+            .sheet(isPresented: $showCrashLog) {
+                NavigationView {
+                    ScrollView {
+                        Text(crashLogText)
+                            .font(.system(.caption2, design: .monospaced))
+                            .padding()
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .navigationTitle("Crash Log")
+                    .navigationBarTitleDisplayMode(.inline)
+                    .toolbar {
+                        ToolbarItem(placement: .navigationBarLeading) {
+                            Button("Close") { showCrashLog = false }
+                        }
+                        ToolbarItem(placement: .navigationBarTrailing) {
+                            Button(role: .destructive) {
+                                CrashLogger.clearLog()
+                                showCrashLog = false
+                            } label: {
+                                Text("Clear")
+                            }
+                        }
                     }
                 }
             }
