@@ -4,7 +4,7 @@
 #include "keys.h"
 #include "util.h"
 
-#define CHUNK_SIZE 16384
+#define CHUNK_SIZE (1024 * 1024)   /* 1 MiB — reduces syscall count ~64x vs old 16 KiB */
 
 #ifndef _DEBUG
 //#	define DONT_UNPACK_IF_EXISTS
@@ -683,8 +683,8 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
 	struct pfs_file_context* file = NULL;
 	char file_path[PATH_MAX];
 	char directory[PATH_MAX];
-	uint8_t chunk[CHUNK_SIZE];
-	const size_t chunk_size = sizeof(chunk);
+	uint8_t* chunk = NULL;          /* heap-allocated — CHUNK_SIZE is now 1 MiB */
+	const size_t chunk_size = CHUNK_SIZE;
 	pfs_ino ino;
 	uint64_t offset;
 	uint64_t size_left;
@@ -701,6 +701,10 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
 	assert(pfs != NULL);
 	assert(path != NULL);
 	assert(output_directory != NULL);
+
+	chunk = (uint8_t*)malloc(chunk_size);
+	if (!chunk)
+		goto error;
 
 	if (!pfs_lookup_path_user(pfs, path, &ino))
 		goto error;
@@ -741,7 +745,12 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
 	if (fd < 0)
 		goto error;
 
-	memset(chunk, 0, sizeof(chunk));
+	/* Tell the kernel we'll write sequentially — allows write coalescing */
+#if defined(F_RDADVISE) || defined(POSIX_FADV_SEQUENTIAL)
+#  if defined(POSIX_FADV_SEQUENTIAL)
+	posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
+#  endif
+#endif
 
 	offset = 0;
 	size_left = file->file_size;
@@ -767,6 +776,8 @@ error:
 
 	if (file)
 		pfs_free_file(file);
+
+	free(chunk);
 
 	return status;
 }
@@ -830,7 +841,7 @@ static enum cb_result pfs_unpack_cb(void* arg, struct pfs* pfs, pfs_ino ino, enu
 			pfs_parse_dir_entries(pfs, data, file->file_size, &pfs_unpack_cb, &new_args);
 		} else if (type == PFS_ENTRY_FILE) {
 			if (!pfs_unpack_single(pfs, file_path, args->output_directory, args->pre_cb, args->pre_cb_arg))
-				warning("Unable to unpack PKG file (skipped): %s", file_path);
+				error("Unable to unpack PKG file: %s", file_path);
 		}
 	}
 

@@ -122,6 +122,11 @@ struct file_map* map_files(const char* const* file_paths, size_t file_count) {
 			goto error;
 		}
 
+		/* Hint to the kernel: we'll read this sequentially — enables aggressive read-ahead */
+#ifdef MADV_SEQUENTIAL
+		madvise(data, (size_t)file_size, MADV_SEQUENTIAL);
+#endif
+
 		fprintf(stderr, "[DIAG] map_files: mmap OK: addr=%p  size=%" PRIu64 "\n",
 		        data, file_size);
 
