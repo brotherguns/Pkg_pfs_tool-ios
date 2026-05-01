@@ -26,27 +26,37 @@ enum SELFConversionError: LocalizedError {
     }
 }
 
-// MARK: – Low-level read helpers
+// MARK: – Low-level read helpers (bounds-checked — throw instead of trapping)
 
-private func readLE16(_ data: Data, at offset: Int) -> UInt16 {
-    UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
+private func readLE16(_ data: Data, at offset: Int) throws -> UInt16 {
+    guard offset >= 0, offset + 2 <= data.count else {
+        throw SELFConversionError.truncated("readLE16 at offset 0x\(String(offset, radix: 16)) (data.count=\(data.count))")
+    }
+    return UInt16(data[offset]) | (UInt16(data[offset + 1]) << 8)
 }
 
-private func readLE32(_ data: Data, at offset: Int) -> UInt32 {
-    UInt32(data[offset])       | (UInt32(data[offset + 1]) << 8) |
-    (UInt32(data[offset + 2]) << 16) | (UInt32(data[offset + 3]) << 24)
+private func readLE32(_ data: Data, at offset: Int) throws -> UInt32 {
+    guard offset >= 0, offset + 4 <= data.count else {
+        throw SELFConversionError.truncated("readLE32 at offset 0x\(String(offset, radix: 16)) (data.count=\(data.count))")
+    }
+    return UInt32(data[offset])
+         | (UInt32(data[offset + 1]) << 8)
+         | (UInt32(data[offset + 2]) << 16)
+         | (UInt32(data[offset + 3]) << 24)
 }
 
-// FIX 1: broken into two sub-expressions so the Swift type-checker doesn't time out
-private func readLE64(_ data: Data, at offset: Int) -> UInt64 {
+private func readLE64(_ data: Data, at offset: Int) throws -> UInt64 {
+    guard offset >= 0, offset + 8 <= data.count else {
+        throw SELFConversionError.truncated("readLE64 at offset 0x\(String(offset, radix: 16)) (data.count=\(data.count))")
+    }
     let lo = UInt64(data[offset])
-            | (UInt64(data[offset + 1]) << 8)
-            | (UInt64(data[offset + 2]) << 16)
-            | (UInt64(data[offset + 3]) << 24)
-    let hi = UInt64(data[offset + 4]) << 32
-            | (UInt64(data[offset + 5]) << 40)
-            | (UInt64(data[offset + 6]) << 48)
-            | (UInt64(data[offset + 7]) << 56)
+           | (UInt64(data[offset + 1]) << 8)
+           | (UInt64(data[offset + 2]) << 16)
+           | (UInt64(data[offset + 3]) << 24)
+    let hi = (UInt64(data[offset + 4]) << 32)
+           | (UInt64(data[offset + 5]) << 40)
+           | (UInt64(data[offset + 6]) << 48)
+           | (UInt64(data[offset + 7]) << 56)
     return lo | hi
 }
 
@@ -93,8 +103,8 @@ struct SELFConverter {
         guard selfData.count >= cursor + 24 else {
             throw SELFConversionError.truncated("SELF extended header")
         }
-        let extHeader = selfData[cursor ..< cursor + 24]
-        let entryCount = Int(readLE16(extHeader, at: 16))
+        let extHeader = Data(selfData[cursor ..< cursor + 24])
+        let entryCount = Int(try readLE16(extHeader, at: 16))
         cursor += 24
 
         // ── 3. SELF entries  ('<4Q' × entryCount) = 32 bytes each ─────────────
@@ -106,9 +116,9 @@ struct SELFConverter {
             guard selfData.count >= cursor + 32 else {
                 throw SELFConversionError.truncated("SELF entry table")
             }
-            let entry = selfData[cursor ..< cursor + 32]
-            let fileOffset = readLE64(entry, at: 8)
-            let fileSize   = readLE64(entry, at: 16)
+            let entry = Data(selfData[cursor ..< cursor + 32])
+            let fileOffset = try readLE64(entry, at: 8)
+            let fileSize   = try readLE64(entry, at: 16)
             cursor += 32
 
             // Read the raw segment bytes stored inside the SELF
@@ -138,7 +148,7 @@ struct SELFConverter {
         guard selfData.count >= cursor + 16 else {
             throw SELFConversionError.truncated("ELF identity")
         }
-        let elfIdent = selfData[cursor ..< cursor + 16]
+        let elfIdent = Data(selfData[cursor ..< cursor + 16])
         cursor += 16
 
         // ── 6. ELF extension header  ('<2HI3QI6H') = 48 bytes ────────────────
@@ -150,9 +160,9 @@ struct SELFConverter {
         guard selfData.count >= cursor + 48 else {
             throw SELFConversionError.truncated("ELF extension header")
         }
-        let elfExt = selfData[cursor ..< cursor + 48]
-        let phNum  = Int(readLE16(elfExt, at: 40))   // e_phnum
-        let shNum  = Int(readLE16(elfExt, at: 44))   // e_shnum
+        let elfExt = Data(selfData[cursor ..< cursor + 48])
+        let phNum  = Int(try readLE16(elfExt, at: 40))   // e_phnum
+        let shNum  = Int(try readLE16(elfExt, at: 44))   // e_shnum
         cursor += 48
 
         // ── 7. Build output ELF in memory ─────────────────────────────────────
@@ -177,11 +187,11 @@ struct SELFConverter {
             guard selfData.count >= cursor + 56 else {
                 throw SELFConversionError.truncated("ELF program header")
             }
-            let ph = selfData[cursor ..< cursor + 56]
+            let ph = Data(selfData[cursor ..< cursor + 56])
             cursor += 56
 
-            let pOffset = readLE64(ph, at: 8)    // p_offset — where segment lives in ELF
-            let pFileSz = readLE64(ph, at: 32)   // p_filesz — size in file
+            let pOffset = try readLE64(ph, at: 8)    // p_offset — where segment lives in ELF
+            let pFileSz = try readLE64(ph, at: 32)   // p_filesz — size in file
 
             // Write the program header struct
             appendData(ph)
