@@ -863,40 +863,13 @@ struct encdec_device* encdec_device_alloc(
     memcpy(combined_key + data_key_size, tweak_key, tweak_key_size);
 
 #if defined(__APPLE__)
-    /* ── Apple: create CCCryptorRef pair for hardware AES-XTS ────────────── */
+    /* ── Apple: manual IEEE 1619 AES-XTS via two kCCModeECB CCCryptorRefs ── */
     {
         /*
-         * (tweak key first, then data key) — the reverse of the mbedTLS
-         * combined_key we built above.  Build a separate buffer here so
-         * the mbedTLS path below remains correct.
-         */
-        uint8_t cc_combined_key[32 * 2];
-        const size_t combined_len = data_key_size + tweak_key_size;
-        uint8_t zero_iv[16];
-        CCCryptorStatus cc_status;
-
-        memcpy(cc_combined_key,                 tweak_key, tweak_key_size);
-        memcpy(cc_combined_key + tweak_key_size, data_key,  data_key_size);
-        memset(zero_iv, 0, sizeof(zero_iv));
-
-        /*
-         * CCCryptorCreateWithMode signature (12 args):
-         *   op, mode, alg, padding, iv,
-         *   key, keyLength, tweak, tweakLength,
-         *   numRounds, options, &cryptorRef
-         *
-         * For XTS the "tweak" arg here is unused (we update it per-sector
-         * via CCCryptorReset); pass NULL/0.  iv is the initial sector tweak
-         * and is also overwritten by Reset before first use.
-         */
-    {
-        /*
-         * Manual IEEE 1619 AES-XTS using two kCCModeECB CCCryptorRefs.
+         * CCCryptorCreate(ECB) is available on all iOS/macOS targets.
+         * Both contexts dispatch to the A-series hardware AES accelerator.
          *   enc_data_ctx / dec_data_ctx : K1 (data key)
          *   enc_tweak_ctx               : K2 (tweak key), always kCCEncrypt
-         *
-         * Key sizes: data_key_size == tweak_key_size (validated above).
-         * CCCryptorCreate takes key length in BYTES.
          */
         const size_t key_bytes = data_key_size;   /* == tweak_key_size */
         uint8_t null_iv[16];
@@ -1005,8 +978,6 @@ encdec_sector_no encdec_device_process(
     memset(u.iv_buf, 0, sizeof(u.iv_buf));
 
 #if defined(__APPLE__)
-    /* ── Apple: hardware AES-XTS via CommonCrypto ────────────────────────── */
-    {
     /* ── Apple: manual IEEE 1619 AES-XTS via two kCCModeECB CCCryptorRefs ─── */
     {
         /*
