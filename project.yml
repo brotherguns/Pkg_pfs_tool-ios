@@ -55,6 +55,7 @@ targets:
     sources:
       # ── Swift app ──────────────────────────────────────────────────
       - path: PKGExtractor/PKGExtractorApp.swift
+      - path: PKGExtractor/CrashLogger.swift
       - path: PKGExtractor/ContentView.swift
       - path: PKGExtractor/ExtractionManager.swift
       - path: PKGExtractor/SELFConverter.swift
