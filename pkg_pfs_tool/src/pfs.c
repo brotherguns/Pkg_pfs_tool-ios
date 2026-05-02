@@ -6,7 +6,6 @@
 
 #include <fcntl.h>
 #include <unistd.h>
-#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -48,105 +47,6 @@
 #ifndef _DEBUG
 //#	define DONT_UNPACK_IF_EXISTS
 #endif
-
-/* ── Opt-3: ping-pong prefetch state ─────────────────────────────────────── */
-
-/*
- * Shared state between the main thread (consumer) and the prefetch thread
- * (producer).  The protocol is a simple two-phase handshake:
- *
- *   producer: fills buf[fill_idx], sets ready=1, signals cond_ready
- *   consumer: waits on cond_ready, swaps indices, sets ready=0,
- *             signals cond_consumed so producer can start the next fill
- *
- * Error propagation: if pfs_file_read() fails inside the producer the
- * prefetch_error flag is set; the consumer checks it before each write.
- */
-struct prefetch_state {
-    /* aligned buffers — two slots for ping-pong */
-    uint8_t*        buf[NUM_PING_PONG];
-
-    /* sizes of the data actually placed in each buffer */
-    size_t          filled[NUM_PING_PONG];
-
-    /* file-position bookkeeping */
-    struct pfs_file_context* file;
-    uint64_t        next_offset;    /* byte offset for the next prefetch */
-    uint64_t        total_size;     /* file->file_size                   */
-
-    /* synchronisation */
-    pthread_mutex_t mtx;
-    pthread_cond_t  cond_ready;     /* producer → consumer: data ready   */
-    pthread_cond_t  cond_consumed;  /* consumer → producer: slot free    */
-
-    int             fill_idx;       /* slot the producer is/will fill    */
-    int             ready;          /* 1 = filled[], 0 = consumer owns   */
-    int             done;           /* no more data to prefetch          */
-    int             prefetch_error; /* pfs_file_read() failed            */
-};
-
-/* Producer thread: reads the next chunk into the non-current slot. */
-static void* prefetch_thread(void* arg) {
-    struct prefetch_state* ps = (struct prefetch_state*)arg;
-    uint64_t size_left;
-    size_t   cur_size;
-    int      ok;
-
-    pthread_mutex_lock(&ps->mtx);
-
-    while (!ps->done && !ps->prefetch_error) {
-        /* Wait until the consumer has finished with the current fill slot */
-        while (ps->ready && !ps->prefetch_error)
-            pthread_cond_wait(&ps->cond_consumed, &ps->mtx);
-
-        if (ps->prefetch_error)
-            break;
-
-        if (ps->next_offset >= ps->total_size) {
-            ps->done  = 1;
-            ps->ready = 1;                   /* wake consumer so it exits */
-            pthread_cond_signal(&ps->cond_ready);
-            break;
-        }
-
-        size_left = ps->total_size - ps->next_offset;
-        cur_size  = (size_left > CHUNK_SIZE) ? CHUNK_SIZE : (size_t)size_left;
-
-        pthread_mutex_unlock(&ps->mtx);
-
-        /* Read outside the lock — this is the expensive mmap/decrypt step */
-        ok = pfs_file_read(ps->file,
-                           ps->next_offset,
-                           ps->buf[ps->fill_idx],
-                           cur_size);
-
-        pthread_mutex_lock(&ps->mtx);
-
-        if (!ok) {
-            ps->prefetch_error = 1;
-            ps->ready = 1;
-            pthread_cond_signal(&ps->cond_ready);
-            break;
-        }
-
-        ps->filled[ps->fill_idx]  = cur_size;
-        ps->next_offset          += cur_size;
-        ps->ready                 = 1;
-        pthread_cond_signal(&ps->cond_ready);
-    }
-
-    pthread_mutex_unlock(&ps->mtx);
-    return NULL;
-}
-
-/* ── Helper: posix_memalign wrapper ─────────────────────────────────────── */
-
-static uint8_t* alloc_aligned_chunk(void) {
-    void* ptr = NULL;
-    if (posix_memalign(&ptr, CHUNK_ALIGN, CHUNK_SIZE) != 0)
-        return NULL;
-    return (uint8_t*)ptr;
-}
 
 /* ══════════════════════════════════════════════════════════════════════════ */
 
@@ -828,20 +728,19 @@ void pfs_free_file(struct pfs_file_context* file) {
  *   Opt-4  F_NOCACHE + ftruncate on the output fd (Apple-only via #if)
  */
 int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_directory, pfs_unpack_pre_cb pre_cb, void* pre_cb_arg) {
-    /* All declarations at top — required for C89 strict mode (Xcode default) */
     struct pfs_file_context* file = NULL;
-    struct prefetch_state ps;
-    pthread_t prefetch_tid;
     char file_path[PATH_MAX];
     char directory[PATH_MAX];
     pfs_ino ino;
     enum pfs_entry_type entry_type;
     enum cb_result ret;
+    uint8_t* chunk = NULL;
+    uint64_t offset;
+    uint64_t size_left;
+    size_t   cur_size;
     int fd = -1;
     int needed;
     int status = 0;
-    int thread_started = 0;
-    int consume_idx = 0;
 #ifdef DONT_UNPACK_IF_EXISTS
     size_t existing_file_size;
 #endif
@@ -850,17 +749,12 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
     assert(path != NULL);
     assert(output_directory != NULL);
 
-    memset(&ps, 0, sizeof(ps));
-
     /*
-     * Opt-2: allocate both buffers with posix_memalign.
-     * 4096-byte alignment is the minimum requirement for F_NOCACHE writes
-     * on APFS.  The allocation size (CHUNK_SIZE = 8 MiB) is page-multiple,
-     * so no padding is needed.
+     * Opt-2: 8 MiB aligned chunk buffer.
+     * posix_memalign(4096) is required for F_NOCACHE (Direct I/O) on APFS —
+     * writes must be page-aligned at the block-device layer.
      */
-    ps.buf[0] = alloc_aligned_chunk();
-    ps.buf[1] = alloc_aligned_chunk();
-    if (!ps.buf[0] || !ps.buf[1])
+    if (posix_memalign((void**)&chunk, CHUNK_ALIGN, CHUNK_SIZE) != 0)
         goto error;
 
     if (!pfs_lookup_path_user(pfs, path, &ino))
@@ -875,7 +769,9 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
     else
         entry_type = PFS_ENTRY_FILE;
 
-    snprintf(file_path, sizeof(file_path), "%s%s%s", output_directory, path, file->type == PFS_FILE_TYPE_DIR ? "/" : "");
+    snprintf(file_path, sizeof(file_path), "%s%s%s",
+             output_directory, path,
+             file->type == PFS_FILE_TYPE_DIR ? "/" : "");
     path_get_directory(directory, sizeof(directory), file_path);
 
     if (pre_cb) {
@@ -894,7 +790,7 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
 
 #ifdef DONT_UNPACK_IF_EXISTS
     existing_file_size = get_file_size(file_path);
-    if (existing_file_size != (uint64_t)-1 && existing_file_size == file->file_size && 0)
+    if (existing_file_size != (uint64_t)-1 && existing_file_size == file->file_size)
         goto done;
 #endif
 
@@ -903,132 +799,63 @@ int pfs_unpack_single(struct pfs* pfs, const char* path, const char* output_dire
         goto error;
 
     /*
-     * Opt-4 (Apple): bypass APFS page cache — writes go directly to the NVMe
-     * queue, eliminating double-buffering in the kernel.  Only meaningful on
-     * Darwin; the #if guard keeps Linux/Windows builds clean.
+     * Opt-4 (Apple): bypass APFS page cache so writes go directly to the
+     * NVMe queue, eliminating kernel double-buffering.
      */
 #if defined(__APPLE__)
     fcntl(fd, F_NOCACHE, 1);
 #endif
 
-    /*
-     * Opt-4: pre-allocate the exact file size so APFS never needs to extend
-     * the inode mid-write (avoids COW cascades on large .pak files).
-     * ftruncate is POSIX and safe on all platforms, so no #if needed here.
-     */
+    /* Pre-allocate exact file size — prevents APFS COW mid-write */
     if (file->file_size > 0)
         ftruncate(fd, (off_t)file->file_size);
 
-    /* Sequential write hint — free on Linux, no-op elsewhere */
 #if defined(POSIX_FADV_SEQUENTIAL)
     posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);
 #endif
 
-    /* ── Opt-3: bootstrap the prefetch pipeline ─────────────────────────
+    /*
+     * Simple sequential loop: read one CHUNK_SIZE chunk at a time,
+     * write it out immediately.  The hardware AES (Opt-1) runs inside
+     * pfs_file_read; the 8 MiB chunk size (Opt-2) and Direct I/O (Opt-4)
+     * ensure we saturate the NVMe bus without page-cache overhead.
      *
-     * Prime buf[0] (consume_idx=0) synchronously so the main loop can start
-     * immediately, then hand buf[1] (fill_idx=1) to the producer thread for
-     * the second chunk.
+     * The double-buffer ping-pong (Opt-3) was removed: on mmap'd PKG
+     * the read latency is dominated by AES decrypt, not page faults, so
+     * overlapping reads with writes yielded no measurable gain and
+     * introduced a deadlock on the final chunk.
      */
-    {
-        /* first_size declared at block top for C89 compatibility */
-        uint64_t first_size;
-        first_size = (file->file_size > (uint64_t)CHUNK_SIZE)
-                     ? (uint64_t)CHUNK_SIZE
-                     : file->file_size;
+    offset = 0;
+    while (offset < file->file_size) {
+        size_left = file->file_size - offset;
+        cur_size  = (size_left > (uint64_t)CHUNK_SIZE)
+                    ? CHUNK_SIZE
+                    : (size_t)size_left;
 
-        if (first_size > 0) {
-            if (!pfs_file_read(file, 0, ps.buf[0], (size_t)first_size))
-                goto error;
-        }
-        ps.filled[0]   = (size_t)first_size;
-        ps.next_offset = first_size;
-        ps.total_size  = file->file_size;
-        ps.file        = file;
-        ps.fill_idx    = 1;  /* producer starts on slot 1 */
-        ps.ready       = 0;
-
-        pthread_mutex_init(&ps.mtx,           NULL);
-        pthread_cond_init (&ps.cond_ready,     NULL);
-        pthread_cond_init (&ps.cond_consumed,  NULL);
-
-        if (pthread_create(&prefetch_tid, NULL, prefetch_thread, &ps) != 0)
-            goto error;
-        thread_started = 1;
-    }
-
-    consume_idx = 0;
-
-    /* ── Main consume loop ───────────────────────────────────────────────
-     *
-     * Each iteration:
-     *   1. Write the current (already-filled) buffer.
-     *   2. Signal the producer that we consumed it (cond_consumed).
-     *   3. Wait for the producer to have the next buffer ready (cond_ready).
-     *   4. Swap indices and repeat.
-     */
-    while (ps.filled[consume_idx] > 0) {
-        size_t cur_size = ps.filled[consume_idx];
-
-        if (write(fd, ps.buf[consume_idx], cur_size) != (ssize_t)cur_size)
+        if (!pfs_file_read(file, offset, chunk, cur_size))
             goto error;
 
-        /* Tell the producer the slot is free */
-        pthread_mutex_lock(&ps.mtx);
-        ps.fill_idx = consume_idx;   /* producer recycles this slot next   */
-        ps.ready    = 0;
-        pthread_cond_signal(&ps.cond_consumed);
-
-        /* Wait until the producer has filled the other slot */
-        while (!ps.ready)
-            pthread_cond_wait(&ps.cond_ready, &ps.mtx);
-
-        if (ps.prefetch_error) {
-            pthread_mutex_unlock(&ps.mtx);
+        if (write(fd, chunk, cur_size) != (ssize_t)cur_size)
             goto error;
-        }
 
-        pthread_mutex_unlock(&ps.mtx);
-
-        /* Swap to the freshly-filled slot */
-        consume_idx ^= 1;
-
-        /* producer sets filled[fill_idx] before signalling ready; the slot
-         * we just swapped to is the one the producer just wrote.            */
-        if (ps.done && ps.filled[consume_idx] == 0)
-            break;
+        offset += cur_size;
     }
 
 done:
     status = 1;
 
 error:
-    /* Join the prefetch thread before freeing shared resources */
-    if (thread_started) {
-        pthread_mutex_lock(&ps.mtx);
-        ps.prefetch_error = 1;     /* wake producer if it's blocked       */
-        pthread_cond_signal(&ps.cond_consumed);
-        pthread_mutex_unlock(&ps.mtx);
-
-        pthread_join(prefetch_tid, NULL);
-
-        pthread_cond_destroy (&ps.cond_consumed);
-        pthread_cond_destroy (&ps.cond_ready);
-        pthread_mutex_destroy(&ps.mtx);
-    }
-
     if (fd > 0)
         close(fd);
 
     if (file)
         pfs_free_file(file);
 
-    /* Opt-2: aligned buffers must be freed with free() — POSIX guarantees this */
-    free(ps.buf[0]);
-    free(ps.buf[1]);
+    free(chunk);
 
     return status;
 }
+
 
 static enum cb_result pfs_unpack_cb(void* arg, struct pfs* pfs, pfs_ino ino, enum pfs_entry_type type, const char* name) {
     struct pfs_unpack_cb_args* args = (struct pfs_unpack_cb_args*)arg;
