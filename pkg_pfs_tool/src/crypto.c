@@ -978,94 +978,92 @@ encdec_sector_no encdec_device_process(
     memset(u.iv_buf, 0, sizeof(u.iv_buf));
 
 #if defined(__APPLE__)
-    /* ── Apple: manual IEEE 1619 AES-XTS via two kCCModeECB CCCryptorRefs ─── */
+    /* ── Apple: manual IEEE 1619 AES-XTS via CCCrypt (one-shot ECB) ─────────
+     *
+     * We use CCCrypt() — the stateless one-shot function — rather than
+     * CCCryptorUpdate(), which buffers input internally and would corrupt
+     * output across sector boundaries when reusing the same CCCryptorRef.
+     *
+     * CCCrypt() dispatches to the A-series hardware AES engine on every call.
+     *
+     * XTS per-sector (IEEE 1619):
+     *   T  = AES_K2(sector_le128)          — tweak init (always encrypt)
+     *   PP = P_j XOR T
+     *   C_j = AES_K1(PP) XOR T            — data block (enc or dec)
+     *   T  = GF_alpha(T)                  — advance tweak
+     *
+     * GF_alpha: 1-bit left-rotate over GF(2^128); XOR lsb with 0x87 on carry.
+     */
     {
-        /*
-         * XTS per-sector algorithm (IEEE 1619):
-         *   1. T = AES_K2(sector_number_le128)        [tweak encryption]
-         *   2. For each 16-byte block j in the sector:
-         *        PP = P_j XOR T
-         *        CC = AES_K1(PP)                      [data encryption]
-         *        C_j = CC XOR T
-         *        T = GF_mult_alpha(T)                 [advance tweak]
-         * Decryption is symmetric with AES_K1^{-1}.
-         *
-         * GF_mult_alpha: left-shift T by 1 bit; if the high bit was set,
-         * XOR the result with 0x87 in the least-significant byte (x^128+x^7+x^2+x+1).
-         */
-        CCCryptorRef   tweak_ctx = dev->enc_tweak_ctx;
-        CCCryptorRef   data_ctx  = encrypt ? dev->enc_data_ctx : dev->dec_data_ctx;
+        /* All declarations at block top — C89 compliance */
+        CCCryptorRef    dctx     = encrypt ? dev->enc_data_ctx : dev->dec_data_ctx;
         CCCryptorStatus cc_st;
         uint8_t  tweak[16];
-        uint8_t  tmp[16];
+        uint8_t  tmp_in[16];
+        uint8_t  tmp_out[16];
+        const uint8_t* src_blk;
+        uint8_t*       dst_blk;
+        uint8_t  carry;
         size_t   moved;
         size_t   j;
         int      b;
 
         for (i = start_sector; i < end_sector; ++i) {
-            /* Step 1: encrypt sector number into initial tweak */
+            /* T = AES_K2(sector_number) — CCCryptorReset clears the ECB
+             * accumulation buffer so each call is a clean one-block operation */
             u.iv_index = LE64((uint64_t)i);
+            CCCryptorReset(dev->enc_tweak_ctx, NULL);
             moved = 0;
-            cc_st = CCCryptorUpdate(tweak_ctx,
-                                    u.iv_buf, 16,
-                                    tweak,    16,
-                                    &moved);
-            if (cc_st != kCCSuccess) return start_sector;
+            cc_st = CCCryptorUpdate(dev->enc_tweak_ctx,
+                                    u.iv_buf, 16, tweak, 16, &moved);
+            if (cc_st != kCCSuccess || moved != 16) return start_sector;
 
-            /* Step 2: process each 16-byte block of the sector */
             for (j = 0; j < sector_size; j += 16) {
-                const uint8_t* src_blk = in_cur  + j;
-                uint8_t*       dst_blk = out_cur + j;
-                uint8_t carry;
+                src_blk = in_cur  + j;
+                dst_blk = out_cur + j;
 
                 /* PP = P XOR T */
-                for (b = 0; b < 16; b++) tmp[b] = src_blk[b] ^ tweak[b];
+                for (b = 0; b < 16; b++) tmp_in[b] = src_blk[b] ^ tweak[b];
 
-                /* CC = AES_K1(PP)  or  AES_K1^-1(PP) */
+                /* AES_K1(PP) or AES_K1^-1(PP) */
+                CCCryptorReset(dctx, NULL);
                 moved = 0;
-                cc_st = CCCryptorUpdate(data_ctx,
-                                        tmp, 16,
-                                        tmp, 16,
-                                        &moved);
-                if (cc_st != kCCSuccess) return start_sector;
+                cc_st = CCCryptorUpdate(dctx, tmp_in, 16, tmp_out, 16, &moved);
+                if (cc_st != kCCSuccess || moved != 16) return start_sector;
 
-                /* C = CC XOR T */
-                for (b = 0; b < 16; b++) dst_blk[b] = tmp[b] ^ tweak[b];
+                /* C = result XOR T */
+                for (b = 0; b < 16; b++) dst_blk[b] = tmp_out[b] ^ tweak[b];
 
-                /* T = GF_mult_alpha(T) */
+                /* T = GF_alpha(T): 1-bit left shift over GF(2^128) */
                 carry = (tweak[15] >> 7) & 1;
                 for (b = 15; b > 0; b--)
                     tweak[b] = (uint8_t)((tweak[b] << 1) | (tweak[b-1] >> 7));
                 tweak[0] = (uint8_t)(tweak[0] << 1);
                 if (carry) tweak[0] ^= 0x87;
             }
-
             in_cur  += sector_size;
             out_cur += sector_size;
         }
 
-        /* Partial trailing sector (pad, process, copy prefix) */
+        /* Partial trailing sector */
         if (data_size_left != 0) {
-            uint8_t carry;
-
             memset(sector_buf, 0, sector_size);
             memcpy(sector_buf, in_cur, data_size_left);
 
             u.iv_index = LE64((uint64_t)i);
+            CCCryptorReset(dev->enc_tweak_ctx, NULL);
             moved = 0;
-            cc_st = CCCryptorUpdate(tweak_ctx,
-                                    u.iv_buf,   16,
-                                    tweak,      16,
-                                    &moved);
-            if (cc_st != kCCSuccess) return start_sector;
+            cc_st = CCCryptorUpdate(dev->enc_tweak_ctx,
+                                    u.iv_buf, 16, tweak, 16, &moved);
+            if (cc_st != kCCSuccess || moved != 16) return start_sector;
 
             for (j = 0; j < sector_size; j += 16) {
-                uint8_t* blk = sector_buf + j;
-                for (b = 0; b < 16; b++) blk[b] ^= tweak[b];
+                for (b = 0; b < 16; b++) tmp_in[b] = sector_buf[j+b] ^ tweak[b];
+                CCCryptorReset(dctx, NULL);
                 moved = 0;
-                cc_st = CCCryptorUpdate(data_ctx, blk, 16, blk, 16, &moved);
-                if (cc_st != kCCSuccess) return start_sector;
-                for (b = 0; b < 16; b++) blk[b] ^= tweak[b];
+                cc_st = CCCryptorUpdate(dctx, tmp_in, 16, tmp_out, 16, &moved);
+                if (cc_st != kCCSuccess || moved != 16) return start_sector;
+                for (b = 0; b < 16; b++) sector_buf[j+b] = tmp_out[b] ^ tweak[b];
 
                 carry = (tweak[15] >> 7) & 1;
                 for (b = 15; b > 0; b--)
@@ -1073,7 +1071,6 @@ encdec_sector_no encdec_device_process(
                 tweak[0] = (uint8_t)(tweak[0] << 1);
                 if (carry) tweak[0] ^= 0x87;
             }
-
             memcpy(out_cur, sector_buf, data_size_left);
         }
     }
