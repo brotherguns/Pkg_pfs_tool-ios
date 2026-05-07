@@ -10,6 +10,10 @@
 #	include "mingw/mman.h"
 #endif
 
+#ifdef __APPLE__
+#	include <unistd.h>  /* pread / pwrite */
+#endif
+
 #define MAP_PAGE_ALIGNMENT 0x4000
 
 struct file_map* map_files(const char* const* file_paths, size_t file_count) {
@@ -119,7 +123,25 @@ struct file_map* map_files(const char* const* file_paths, size_t file_count) {
 		if (data == MAP_FAILED) {
 			fprintf(stderr, "[DIAG] map_files: mmap() failed: errno=%d (%s)  size=%" PRIu64 "\n",
 			        errno, strerror(errno), file_size);
+#ifdef __APPLE__
+			/*
+			 * iOS refuses to mmap files larger than ~2 GB in a sideloaded app.
+			 * Fall back to a pread-mode map: data stays NULL, use_pread=1.
+			 * The fd is kept open; all I/O goes through map_pread().
+			 */
+			fprintf(stderr, "[DIAG] map_files: mmap failed — falling back to pread mode\n");
+			map->fds[0]         = fd;
+			map->segments[0].base = MAP_FAILED;  /* no mmap region */
+			map->data           = NULL;
+			map->size           = total_file_size;
+			map->write          = 0;
+			map->submap         = 0;
+			map->use_pread      = 1;
+			fd = -1;
+			return map;
+#else
 			goto error;
+#endif
 		}
 
 		/* Hint to the kernel: we'll read this sequentially — enables aggressive read-ahead */
@@ -368,3 +390,69 @@ void unmap_file(struct file_map* map) {
 
 	free(map);
 }
+
+#ifdef __APPLE__
+/*
+ * map_pread / map_pwrite — used when map->use_pread == 1.
+ *
+ * Reads/writes exactly `n` bytes at absolute file offset `off`.
+ * Returns 1 on success, 0 on any short read/write or error.
+ */
+int map_pread(const struct file_map* map, void* buf, uint64_t n, uint64_t off) {
+	uint8_t* dst = (uint8_t*)buf;
+	uint64_t remaining = n;
+	off_t file_off = (off_t)(map->offset + off);
+
+	assert(map != NULL);
+	assert(map->use_pread);
+	assert(map->fds != NULL && map->fds[0] >= 0);
+
+	while (remaining > 0) {
+		ssize_t got = pread(map->fds[0], dst, (size_t)remaining, file_off);
+		if (got <= 0) {
+			fprintf(stderr, "[DIAG] map_pread: pread failed: off=%" PRIu64 " n=%" PRIu64 " errno=%d (%s)\n",
+			        (uint64_t)file_off, n, errno, strerror(errno));
+			return 0;
+		}
+		dst      += got;
+		file_off += got;
+		remaining -= (uint64_t)got;
+	}
+	return 1;
+}
+
+int map_pwrite(const struct file_map* map, const void* buf, uint64_t n, uint64_t off) {
+	const uint8_t* src = (const uint8_t*)buf;
+	uint64_t remaining = n;
+	off_t file_off = (off_t)(map->offset + off);
+
+	assert(map != NULL);
+	assert(map->use_pread);
+	assert(map->fds != NULL && map->fds[0] >= 0);
+
+	while (remaining > 0) {
+		ssize_t wrote = pwrite(map->fds[0], src, (size_t)remaining, file_off);
+		if (wrote <= 0) {
+			fprintf(stderr, "[DIAG] map_pwrite: pwrite failed: off=%" PRIu64 " n=%" PRIu64 " errno=%d (%s)\n",
+			        (uint64_t)file_off, n, errno, strerror(errno));
+			return 0;
+		}
+		src      += wrote;
+		file_off += wrote;
+		remaining -= (uint64_t)wrote;
+	}
+	return 1;
+}
+#else
+/* Stub for non-Apple: use_pread is never set, these should never be called. */
+int map_pread(const struct file_map* map, void* buf, uint64_t n, uint64_t off) {
+	(void)map; (void)buf; (void)n; (void)off;
+	assert(0 && "map_pread called on non-Apple platform");
+	return 0;
+}
+int map_pwrite(const struct file_map* map, const void* buf, uint64_t n, uint64_t off) {
+	(void)map; (void)buf; (void)n; (void)off;
+	assert(0 && "map_pwrite called on non-Apple platform");
+	return 0;
+}
+#endif

@@ -929,6 +929,7 @@ error:
 
 static int get_pkg_total_size(const char* file_path, uint64_t* size) {
 	struct file_map* map = NULL;
+	struct pkg_header hdr_buf;
 	struct pkg_header* hdr;
 	int status = 0;
 
@@ -936,7 +937,13 @@ static int get_pkg_total_size(const char* file_path, uint64_t* size) {
 	if (!map)
 		goto error;
 
-	hdr = (struct pkg_header*)map->data;
+	if (map->use_pread) {
+		if (!map_pread(map, &hdr_buf, sizeof(hdr_buf), 0))
+			goto error;
+		hdr = &hdr_buf;
+	} else {
+		hdr = (struct pkg_header*)map->data;
+	}
 
 	if (size)
 		*size = BE64(hdr->pfs_image_offset) + BE64(hdr->pfs_image_size);
@@ -1033,7 +1040,22 @@ struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_opti
 	if (!pkg->map)
 		goto error;
 
-	pkg->hdr = (struct pkg_header*)pkg->map->data;
+	if (pkg->map->use_pread) {
+		/*
+		 * pread-mode: the file is too large to mmap on iOS.
+		 * Allocate a buffer for the PKG header (first PKG_HEADER_SIZE bytes)
+		 * and pread it once.  All subsequent I/O goes through map_pread().
+		 */
+		pkg->hdr = (struct pkg_header*)malloc(PKG_HEADER_SIZE);
+		if (!pkg->hdr)
+			goto error;
+		pkg->hdr_owned = 1;
+		if (!map_pread(pkg->map, pkg->hdr, PKG_HEADER_SIZE, 0))
+			goto error;
+	} else {
+		pkg->hdr = (struct pkg_header*)pkg->map->data;
+		pkg->hdr_owned = 0;
+	}
 
 	pkg->entry_table = (struct pkg_table_entry*)((uint8_t*)pkg->hdr + BE32(pkg->hdr->entry_table_offset));
 	pkg->entry_count = BE32(pkg->hdr->entry_count);
@@ -1216,6 +1238,9 @@ error:
 		if (pkg->map)
 			unmap_file(pkg->map);
 
+		if (pkg->hdr_owned)
+			free(pkg->hdr);
+
 		free(pkg);
 	}
 
@@ -1246,6 +1271,9 @@ void pkg_free(struct pkg* pkg) {
 
 	if (pkg->map)
 		unmap_file(pkg->map);
+
+	if (pkg->hdr_owned)
+		free(pkg->hdr);
 
 	free(pkg);
 }
@@ -1342,7 +1370,16 @@ uint8_t* pkg_locate_entry_data(struct pkg* pkg, enum pkg_entry_id id, uint64_t* 
 	if (!entry)
 		return NULL;
 
-	data = pkg->map->data + BE32(entry->offset);
+	if (pkg->map->use_pread) {
+		/*
+		 * pread-mode: entry data lives in the header region which was
+		 * already read into pkg->hdr (the malloc'd buffer).
+		 * Cast to uint8_t* and index from the start of that buffer.
+		 */
+		data = (uint8_t*)pkg->hdr + BE32(entry->offset);
+	} else {
+		data = pkg->map->data + BE32(entry->offset);
+	}
 	if (offset)
 		*offset = BE32(entry->offset);
 	if (size)
@@ -1580,6 +1617,13 @@ static int pfs_read_cb(void* arg, void* data, uint64_t data_size) {
 	if (pkg->pfs_offset + data_size > pkg->pfs_image_size)
 		return 0;
 
+	if (pkg->map->use_pread) {
+		return map_pread(pkg->map,
+		                 data,
+		                 data_size,
+		                 pkg->pfs_image_offset + pkg->pfs_offset);
+	}
+
 	memcpy(data, pkg->map->data + pkg->pfs_image_offset + pkg->pfs_offset, data_size);
 
 	return 1;
@@ -1593,6 +1637,13 @@ static int pfs_write_cb(void* arg, void* data, uint64_t data_size) {
 
 	if (pkg->pfs_offset + data_size > pkg->pfs_image_size)
 		return 0;
+
+	if (pkg->map->use_pread) {
+		return map_pwrite(pkg->map,
+		                  data,
+		                  data_size,
+		                  pkg->pfs_image_offset + pkg->pfs_offset);
+	}
 
 	memcpy(pkg->map->data + pkg->pfs_image_offset + pkg->pfs_offset, data, data_size);
 

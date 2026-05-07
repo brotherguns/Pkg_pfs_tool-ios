@@ -777,6 +777,11 @@ struct pkg {
 	size_t sc_entry_count;
 	pfs_ino image_file_ino;
 	int finalized;
+	/*
+	 * hdr_owned: set when hdr was malloc'd separately (pread-mode map).
+	 * pkg_free() must free(pkg->hdr) when this is set.
+	 */
+	int hdr_owned;
 };
 
 struct pkg_entry_desc {
