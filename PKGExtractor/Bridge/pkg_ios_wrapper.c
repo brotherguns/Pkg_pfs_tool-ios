@@ -331,6 +331,8 @@ static int pkg_ios_run(
 ) {
     struct pkg* pkg = NULL;
     int ret = -1;
+    char tmp_dir[64]  = { 0 };   /* used only when list_only=1 */
+    char tmp_image0[4096] = { 0 };
 
     if (!pkg_path || !config_path || (!list_only && !output_dir)) {
         set_error("NULL argument passed to pkg_ios_run");
@@ -354,6 +356,9 @@ static int pkg_ios_run(
         if (pkg) { pkg_free(pkg); pkg = NULL; }
         keymgr_finalize();
         crypto_finalize();
+        /* Clean up temp dir if abort fired during listing */
+        if (tmp_image0[0]) rmdir(tmp_image0);
+        if (tmp_dir[0])    rmdir(tmp_dir);
         g_pkg_abort_active = 0;
         return -1;
     }
@@ -372,16 +377,14 @@ static int pkg_ios_run(
 
     if (list_only) {
         /* Enumerate without writing — pass a temp dir that we never actually use */
-        char tmp_dir[] = "/tmp/pkg_ios_list_XXXXXX";
+        strncpy(tmp_dir, "/tmp/pkg_ios_list_XXXXXX", sizeof(tmp_dir) - 1);
         char* td = mkdtemp(tmp_dir);
         const char* enum_dir = td ? td : "/tmp";
 
-        char image0[4096];
-        snprintf(image0, sizeof(image0), "%s/Image0", enum_dir);
-        /* mkdir will silently fail or succeed — we don't care */
-        mkdir_p(image0);
+        snprintf(tmp_image0, sizeof(tmp_image0), "%s/Image0", enum_dir);
+        mkdir_p(tmp_image0);
 
-        int ok = pfs_unpack_all(pkg->inner_pfs, image0, ios_list_pre_cb, &ctx);
+        int ok = pfs_unpack_all(pkg->inner_pfs, tmp_image0, ios_list_pre_cb, &ctx);
         if (!ok) {
             set_error("pfs_unpack_all failed during file listing.");
             append_warn_log_to_error();
@@ -391,8 +394,10 @@ static int pkg_ios_run(
 
         /* Clean up temp dir (best-effort) */
         if (td) {
-            rmdir(image0);
-            rmdir(td);
+            rmdir(tmp_image0);
+            rmdir(tmp_dir);
+            tmp_image0[0] = '\0';
+            tmp_dir[0]    = '\0';
         }
     } else {
         char image0[4096];
