@@ -123,6 +123,9 @@ struct ContentView: View {
                         showFilePicker = false
                         startExtraction(url: pkg, files: selectedFiles)
                     } onCancel: {
+                        if let pkg = pickerPKG {
+                            manager.saveSelection(selectedFiles, for: pkg)
+                        }
                         showFilePicker = false
                         pickerPKG      = nil
                         selectedPKG    = nil
@@ -271,12 +274,13 @@ struct ContentView: View {
         guard !manager.isExtracting && !manager.isListing else { return }
         selectedPKG    = url
         pickerPKG      = url
-        selectedFiles  = []
+        selectedFiles  = manager.savedSelection(for: url)
         showFilePicker = true
         manager.listFiles(pkgURL: url)
     }
 
     private func startExtraction(url: URL, files: Set<String>) {
+        manager.saveSelection(files, for: url)
         manager.extract(pkgURL: url, selectedFiles: files.isEmpty ? nil : files)
     }
 }
@@ -337,18 +341,23 @@ struct FilePickerSheet: View {
     let onExtract:     () -> Void
     let onCancel:      () -> Void
 
-    // Local search / filter
-    @State private var searchText = ""
+    @State private var searchText        = ""
+    @State private var displayedFiles:   [(path: String, size: UInt64, isDir: Bool)] = []
+    @State private var allSelected       = false
+    @State private var selectedTotalSize = UInt64(0)
 
-    private var displayedFiles: [(path: String, size: UInt64, isDir: Bool)] {
-        let files = manager.listedFiles
-        guard !searchText.isEmpty else { return files }
-        return files.filter { $0.path.localizedCaseInsensitiveContains(searchText) }
-    }
-
-    private var allSelected: Bool {
-        !displayedFiles.isEmpty &&
-        displayedFiles.allSatisfy { selectedFiles.contains($0.path) }
+    // Recompute all derived state in one place, called from onChange
+    private func recompute() {
+        let base = manager.listedFiles
+        let filtered = searchText.isEmpty
+            ? base
+            : base.filter { $0.path.localizedCaseInsensitiveContains(searchText) }
+        displayedFiles   = filtered
+        allSelected      = !filtered.isEmpty && filtered.allSatisfy { selectedFiles.contains($0.path) }
+        selectedTotalSize = base
+            .lazy
+            .filter { !$0.isDir && selectedFiles.contains($0.path) }
+            .reduce(0) { $0 + $1.size }
     }
 
     var body: some View {
@@ -396,6 +405,11 @@ struct FilePickerSheet: View {
                             Text("\(selectedFiles.count) of \(manager.listedFiles.count)")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
+                            if selectedTotalSize > 0 {
+                                Text(ByteCountFormatter.string(fromByteCount: Int64(selectedTotalSize), countStyle: .file))
+                                    .font(.caption)
+                                    .foregroundColor(.blue)
+                            }
                         }
                         .contentShape(Rectangle())
                         .onTapGesture {
@@ -452,13 +466,22 @@ struct FilePickerSheet: View {
                     Button {
                         onExtract()
                     } label: {
-                        Text(selectedFiles.isEmpty ? "Extract All" : "Extract (\(selectedFiles.count))")
-                            .bold()
+                        if selectedFiles.isEmpty {
+                            Text("Extract All")
+                                .bold()
+                        } else {
+                            Text("Extract (\(selectedFiles.count)) — \(ByteCountFormatter.string(fromByteCount: Int64(selectedTotalSize), countStyle: .file))")
+                                .bold()
+                        }
                     }
                     .disabled(manager.isListing)
                 }
             }
         }
+        .onAppear { recompute() }
+        .onChange(of: searchText)    { _ in recompute() }
+        .onChange(of: selectedFiles) { _ in recompute() }
+        .onChange(of: manager.listedFiles.count) { _ in recompute() }
     }
 }
 

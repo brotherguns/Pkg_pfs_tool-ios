@@ -6,6 +6,7 @@
 //
 
 import Foundation
+import UIKit
 
 @MainActor
 class ExtractionManager: ObservableObject {
@@ -26,6 +27,38 @@ class ExtractionManager: ObservableObject {
     // ── SELF conversion state ─────────────────────────────────────────
     @Published var elfConversionResult: String? = nil
 
+    // ── Saved selections per PKG path ─────────────────────────────────
+    private var savedSelections: [String: Set<String>] = [:]
+
+    func savedSelection(for pkgURL: URL) -> Set<String> {
+        savedSelections[pkgURL.path] ?? []
+    }
+
+    func saveSelection(_ selection: Set<String>, for pkgURL: URL) {
+        savedSelections[pkgURL.path] = selection
+    }
+
+    // ── File list cache ───────────────────────────────────────────────
+    // Key: pkgPath, Value: (mtime at scan time, sorted entries)
+    // Invalidated automatically if the file's mtime changes.
+    private struct CacheEntry {
+        let mtime:   Date
+        let entries: [(path: String, size: UInt64, isDir: Bool)]
+    }
+    private var listCache: [String: CacheEntry] = [:]
+
+    private func cachedEntries(for pkgURL: URL) -> [(path: String, size: UInt64, isDir: Bool)]? {
+        guard let entry = listCache[pkgURL.path],
+              let mtime = (try? pkgURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate,
+              mtime == entry.mtime else { return nil }
+        return entry.entries
+    }
+
+    private func cacheEntries(_ entries: [(path: String, size: UInt64, isDir: Bool)], for pkgURL: URL) {
+        guard let mtime = (try? pkgURL.resourceValues(forKeys: [.contentModificationDateKey]))?.contentModificationDate else { return }
+        listCache[pkgURL.path] = CacheEntry(mtime: mtime, entries: entries)
+    }
+
     // ─────────────────────────────────────────────────────────────────
     // MARK: – List files in a PKG (no extraction)
     // ─────────────────────────────────────────────────────────────────
@@ -34,6 +67,13 @@ class ExtractionManager: ObservableObject {
     /// Results are stored in `listedFiles`; `listError` is set on failure.
     func listFiles(pkgURL: URL) {
         guard !isListing && !isExtracting else { return }
+
+        // ── Cache hit — serve instantly, no C decryption needed ───────
+        if let cached = cachedEntries(for: pkgURL) {
+            listedFiles = cached
+            listError   = nil
+            return
+        }
 
         isListing   = true
         listError   = nil
@@ -67,13 +107,17 @@ class ExtractionManager: ObservableObject {
             Unmanaged<FileEntryCollector>.fromOpaque(collectorPtr).release()
             Unmanaged<ExtractionManager>.fromOpaque(selfPtr).release()
 
-            let entries = collector.entries
-            let errMsg  = result == 0 ? nil : String(cString: pkg_ios_last_error())
+            // Sort on background thread before hitting main actor
+            let sorted = result == 0 ? collector.entries.sorted { $0.path < $1.path } : []
+            let errMsg = result == 0 ? nil : String(cString: pkg_ios_last_error())
 
             await MainActor.run {
-                self.listedFiles = entries.sorted { $0.path < $1.path }
+                self.listedFiles = sorted
                 self.listError   = errMsg
                 self.isListing   = false
+                if errMsg == nil {
+                    self.cacheEntries(sorted, for: pkgURL)
+                }
             }
         }
     }
@@ -90,6 +134,25 @@ class ExtractionManager: ObservableObject {
     ///                    set to extract everything.
     func extract(pkgURL: URL, selectedFiles: Set<String>? = nil) {
         guard !isExtracting else { return }
+
+        // ── Free space check ──────────────────────────────────────────
+        if let sel = selectedFiles, !sel.isEmpty {
+            let needed = listedFiles
+                .filter { !$0.isDir && sel.contains($0.path) }
+                .reduce(UInt64(0)) { $0 + $1.size }
+            if needed > 0 {
+                let docs = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                if let free = (try? docs.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?.volumeAvailableCapacityForImportantUsage {
+                    if Int64(needed) > free {
+                        let neededStr = ByteCountFormatter.string(fromByteCount: Int64(needed), countStyle: .file)
+                        let freeStr   = ByteCountFormatter.string(fromByteCount: free, countStyle: .file)
+                        lastError = "Not enough free space — need \(neededStr), only \(freeStr) available."
+                        finished  = true
+                        return
+                    }
+                }
+            }
+        }
 
         isExtracting        = true
         finished            = false
@@ -116,8 +179,16 @@ class ExtractionManager: ObservableObject {
         let cfgPath  = configPath
         let selfPtr  = Unmanaged.passRetained(self).toOpaque()
 
-        // Build a C-compatible filter array (lives for the duration of the task)
         let filterList: [String]? = selectedFiles.flatMap { $0.isEmpty ? nil : Array($0) }
+
+        // ── Background task — prevents iOS killing us mid-extraction ──
+        var bgTask: UIBackgroundTaskIdentifier = .invalid
+        bgTask = UIApplication.shared.beginBackgroundTask(withName: "PKGExtraction") {
+            // Expiration handler — we can't stop the C extraction cleanly,
+            // but we mark it so the UI reflects reality when we resume.
+            UIApplication.shared.endBackgroundTask(bgTask)
+            bgTask = .invalid
+        }
 
         Task.detached(priority: .userInitiated) {
 
@@ -192,6 +263,10 @@ class ExtractionManager: ObservableObject {
                 self.lastError           = errMsg
                 self.elfConversionResult = elfMsg
                 if result == 0 { self.outputURL = outDir }
+            }
+
+            if bgTask != .invalid {
+                await UIApplication.shared.endBackgroundTask(bgTask)
             }
         }
     }
