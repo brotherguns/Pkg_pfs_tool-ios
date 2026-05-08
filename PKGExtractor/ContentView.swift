@@ -347,8 +347,8 @@ struct FilePickerSheet: View {
     }
 
     private var allSelected: Bool {
-        !manager.listedFiles.isEmpty &&
-        manager.listedFiles.allSatisfy { selectedFiles.contains($0.path) }
+        !displayedFiles.isEmpty &&
+        displayedFiles.allSatisfy { selectedFiles.contains($0.path) }
     }
 
     var body: some View {
@@ -400,9 +400,9 @@ struct FilePickerSheet: View {
                         .contentShape(Rectangle())
                         .onTapGesture {
                             if allSelected {
-                                selectedFiles = []
+                                displayedFiles.forEach { selectedFiles.remove($0.path) }
                             } else {
-                                selectedFiles = Set(manager.listedFiles.map { $0.path })
+                                displayedFiles.forEach { selectedFiles.insert($0.path) }
                             }
                         }
 
