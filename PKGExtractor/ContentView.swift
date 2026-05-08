@@ -340,15 +340,15 @@ struct FilePickerSheet: View {
     // Local search / filter
     @State private var searchText = ""
 
-    private var displayedFiles: [String] {
+    private var displayedFiles: [(path: String, size: UInt64, isDir: Bool)] {
         let files = manager.listedFiles
         guard !searchText.isEmpty else { return files }
-        return files.filter { $0.localizedCaseInsensitiveContains(searchText) }
+        return files.filter { $0.path.localizedCaseInsensitiveContains(searchText) }
     }
 
     private var allSelected: Bool {
         !manager.listedFiles.isEmpty &&
-        manager.listedFiles.allSatisfy { selectedFiles.contains($0) }
+        manager.listedFiles.allSatisfy { selectedFiles.contains($0.path) }
     }
 
     var body: some View {
@@ -402,19 +402,21 @@ struct FilePickerSheet: View {
                             if allSelected {
                                 selectedFiles = []
                             } else {
-                                selectedFiles = Set(manager.listedFiles)
+                                selectedFiles = Set(manager.listedFiles.map { $0.path })
                             }
                         }
 
-                        ForEach(displayedFiles, id: \.self) { path in
+                        ForEach(displayedFiles, id: \.path) { entry in
                             FilePickerRow(
-                                path: path,
-                                isSelected: selectedFiles.contains(path)
+                                path: entry.path,
+                                size: entry.size,
+                                isDir: entry.isDir,
+                                isSelected: selectedFiles.contains(entry.path)
                             ) {
-                                if selectedFiles.contains(path) {
-                                    selectedFiles.remove(path)
+                                if selectedFiles.contains(entry.path) {
+                                    selectedFiles.remove(entry.path)
                                 } else {
-                                    selectedFiles.insert(path)
+                                    selectedFiles.insert(entry.path)
                                 }
                             }
                         }
@@ -431,7 +433,16 @@ struct FilePickerSheet: View {
                 }
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button {
-                        UIPasteboard.general.string = manager.listedFiles.joined(separator: "\n")
+                        let text = manager.listedFiles.map { entry in
+                            if entry.isDir {
+                                return "\(entry.path)/"
+                            } else {
+                                let formatted = ByteCountFormatter.string(
+                                    fromByteCount: Int64(entry.size), countStyle: .file)
+                                return "\(entry.path) (\(formatted))"
+                            }
+                        }.joined(separator: "\n")
+                        UIPasteboard.general.string = text
                     } label: {
                         Image(systemName: "doc.on.clipboard")
                     }
@@ -454,11 +465,13 @@ struct FilePickerSheet: View {
 // ── Single row in the file picker ───────────────────────────────────────────
 struct FilePickerRow: View {
     let path:       String
+    let size:       UInt64
+    let isDir:      Bool
     let isSelected: Bool
     let onToggle:   () -> Void
 
     private var icon: String {
-        if path.hasSuffix("/")     { return "folder.fill" }
+        if isDir { return "folder.fill" }
         let ext = (path as NSString).pathExtension.lowercased()
         switch ext {
         case "bin", "elf", "self": return "cpu"
@@ -477,6 +490,11 @@ struct FilePickerRow: View {
     private var directory: String {
         let dir = (path as NSString).deletingLastPathComponent
         return dir.isEmpty ? "" : dir + "/"
+    }
+
+    private var sizeLabel: String {
+        guard !isDir else { return "" }
+        return ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file)
     }
 
     var body: some View {
@@ -500,6 +518,13 @@ struct FilePickerRow: View {
                 }
 
                 Spacer()
+
+                if !sizeLabel.isEmpty {
+                    Text(sizeLabel)
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .monospacedDigit()
+                }
 
                 Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
                     .foregroundColor(isSelected ? .blue : Color(.systemGray4))

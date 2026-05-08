@@ -20,7 +20,7 @@ class ExtractionManager: ObservableObject {
 
     // ── Listing state ─────────────────────────────────────────────────
     @Published var isListing     = false
-    @Published var listedFiles: [String] = []
+    @Published var listedFiles: [(path: String, size: UInt64, isDir: Bool)] = []
     @Published var listError: String? = nil
 
     // ── SELF conversion state ─────────────────────────────────────────
@@ -50,29 +50,28 @@ class ExtractionManager: ObservableObject {
         let selfPtr  = Unmanaged.passRetained(self).toOpaque()
 
         Task.detached(priority: .userInitiated) {
-            // Accumulate paths in a thread-safe array (C callback fires on background thread)
-            let collector = PathCollector()
+            let collector = FileEntryCollector()
             let collectorPtr = Unmanaged.passRetained(collector).toOpaque()
 
-            let result = pkg_ios_list_files(
+            let result = pkg_ios_list_files_ex(
                 pkgPath,
                 cfgPath,
-                { ctx, rawPath in
+                { ctx, rawPath, size, isDir in
                     guard let ctx, let rawPath else { return }
-                    let col = Unmanaged<PathCollector>.fromOpaque(ctx).takeUnretainedValue()
-                    col.append(String(cString: rawPath))
+                    let col = Unmanaged<FileEntryCollector>.fromOpaque(ctx).takeUnretainedValue()
+                    col.append(path: String(cString: rawPath), size: size, isDir: isDir != 0)
                 },
                 collectorPtr
             )
 
-            Unmanaged<PathCollector>.fromOpaque(collectorPtr).release()
+            Unmanaged<FileEntryCollector>.fromOpaque(collectorPtr).release()
             Unmanaged<ExtractionManager>.fromOpaque(selfPtr).release()
 
-            let paths   = collector.paths
+            let entries = collector.entries
             let errMsg  = result == 0 ? nil : String(cString: pkg_ios_last_error())
 
             await MainActor.run {
-                self.listedFiles = paths.sorted()
+                self.listedFiles = entries.sorted { $0.path < $1.path }
                 self.listError   = errMsg
                 self.isListing   = false
             }
@@ -229,20 +228,20 @@ class ExtractionManager: ObservableObject {
 }
 
 // ─────────────────────────────────────────────────────────────────────
-// MARK: – PathCollector  (thread-safe accumulator for C callbacks)
+// MARK: – FileEntryCollector  (thread-safe accumulator for C callbacks)
 // ─────────────────────────────────────────────────────────────────────
 
-private final class PathCollector: @unchecked Sendable {
-    private var _paths: [String] = []
+private final class FileEntryCollector: @unchecked Sendable {
+    private var _entries: [(path: String, size: UInt64, isDir: Bool)] = []
     private let lock = NSLock()
 
-    func append(_ path: String) {
+    func append(path: String, size: UInt64, isDir: Bool) {
         lock.lock(); defer { lock.unlock() }
-        _paths.append(path)
+        _entries.append((path: path, size: size, isDir: isDir))
     }
 
-    var paths: [String] {
+    var entries: [(path: String, size: UInt64, isDir: Bool)] {
         lock.lock(); defer { lock.unlock() }
-        return _paths
+        return _entries
     }
 }
