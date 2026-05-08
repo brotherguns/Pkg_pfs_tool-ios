@@ -429,6 +429,14 @@ struct FilePickerSheet: View {
                 ToolbarItem(placement: .navigationBarLeading) {
                     Button("Cancel", action: onCancel)
                 }
+                ToolbarItem(placement: .navigationBarLeading) {
+                    Button {
+                        UIPasteboard.general.string = manager.listedFiles.joined(separator: "\n")
+                    } label: {
+                        Image(systemName: "doc.on.clipboard")
+                    }
+                    .disabled(manager.isListing || manager.listedFiles.isEmpty)
+                }
                 ToolbarItem(placement: .navigationBarTrailing) {
                     Button {
                         onExtract()
