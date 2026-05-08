@@ -13,6 +13,15 @@ extern "C" {
 typedef void (*pkg_ios_progress_cb)(void* ctx, const char* path);
 
 /**
+ * List callback with file size — called by pkg_ios_list_files_ex for each entry.
+ * @param ctx   opaque pointer you passed to the function
+ * @param path  relative path of the file or directory
+ * @param size  file size in bytes (0 for directories)
+ * @param is_dir 1 if directory, 0 if file
+ */
+typedef void (*pkg_ios_list_cb)(void* ctx, const char* path, uint64_t size, int is_dir);
+
+/**
  * Extract a PS4 PKG file to a directory.
  *
  * @param pkg_path     absolute path to the .pkg file
@@ -74,6 +83,24 @@ int pkg_ios_list_files(
 
 /** Human-readable description of the last error on the calling thread. */
 const char* pkg_ios_last_error(void);
+
+/**
+ * List all files inside a PKG with file sizes, without extracting.
+ * Uses pfs_enum_user_root_directory — passes path, byte size, and is_dir flag.
+ *
+ * @param pkg_path    absolute path to the .pkg file
+ * @param config_path absolute path to the config.ini
+ * @param list_cb     called for every entry inside the PKG
+ * @param cb_ctx      passed verbatim to list_cb
+ *
+ * @return  0 on success, -1 on failure. Call pkg_ios_last_error() for details.
+ */
+int pkg_ios_list_files_ex(
+    const char*       pkg_path,
+    const char*       config_path,
+    pkg_ios_list_cb   list_cb,
+    void*             cb_ctx
+);
 
 /** Read the content_id from the PKG header without decrypting.
  *  @return 1 on success, 0 on failure. */

@@ -457,6 +457,87 @@ int pkg_ios_list_files(
 }
 
 /* ------------------------------------------------------------------ */
+/* pkg_ios_list_files_ex — pfs_enum_user_root_directory with sizes    */
+/* ------------------------------------------------------------------ */
+
+struct ios_list_ex_ctx {
+    pkg_ios_list_cb  list_cb;
+    void*            user_ctx;
+};
+
+static enum cb_result ios_list_ex_enum_cb(
+    void* arg,
+    struct pfs* pfs,
+    pfs_ino ino,
+    enum pfs_entry_type type,
+    const char* path,
+    uint64_t size,
+    uint32_t flags
+) {
+    struct ios_list_ex_ctx* ctx = (struct ios_list_ex_ctx*)arg;
+    UNUSED(pfs); UNUSED(ino); UNUSED(flags);
+    if (ctx && ctx->list_cb && path)
+        ctx->list_cb(ctx->user_ctx, path, size, type == PFS_ENTRY_DIRECTORY ? 1 : 0);
+    return CB_RESULT_CONTINUE;
+}
+
+int pkg_ios_list_files_ex(
+    const char*       pkg_path,
+    const char*       config_path,
+    pkg_ios_list_cb   list_cb,
+    void*             cb_ctx
+) {
+    struct pkg* pkg = NULL;
+    int ret = -1;
+
+    if (!pkg_path || !config_path) {
+        set_error("NULL argument passed to pkg_ios_list_files_ex");
+        return -1;
+    }
+
+    g_pkg_warn_log[0] = '\0';
+    s_callback_count  = 0;
+
+    g_pkg_abort_active = 1;
+    g_pkg_abort_msg[0] = '\0';
+
+    if (setjmp(g_pkg_abort_jmp) != 0) {
+        char errbuf[2048];
+        snprintf(errbuf, sizeof(errbuf), "%s",
+                 g_pkg_abort_msg[0] ? g_pkg_abort_msg : "list_ex failed");
+        set_error(errbuf);
+        append_warn_log_to_error();
+        if (pkg) { pkg_free(pkg); pkg = NULL; }
+        keymgr_finalize();
+        crypto_finalize();
+        g_pkg_abort_active = 0;
+        return -1;
+    }
+
+    if (pkg_open(pkg_path, config_path, &pkg) != 0) {
+        g_pkg_abort_active = 0;
+        return -1;
+    }
+
+    struct ios_list_ex_ctx ctx;
+    ctx.list_cb  = list_cb;
+    ctx.user_ctx = cb_ctx;
+
+    if (!pfs_enum_user_root_directory(pkg->inner_pfs, ios_list_ex_enum_cb, &ctx)) {
+        set_error("pfs_enum_user_root_directory failed.");
+        append_warn_log_to_error();
+    } else {
+        ret = 0;
+    }
+
+    pkg_free(pkg);
+    keymgr_finalize();
+    crypto_finalize();
+    g_pkg_abort_active = 0;
+    return ret;
+}
+
+/* ------------------------------------------------------------------ */
 /* Read content_id without full decryption (for UI display)           */
 /* ------------------------------------------------------------------ */
 
