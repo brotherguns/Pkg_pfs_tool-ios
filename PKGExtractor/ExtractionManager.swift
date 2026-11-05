@@ -27,6 +27,35 @@ class ExtractionManager: ObservableObject {
     // ── SELF conversion state ─────────────────────────────────────────
     @Published var elfConversionResult: String? = nil
 
+    // ── Decryption credentials (persisted) ────────────────────────────
+    /// 32-character passcode. Empty = default (all zeros).
+    @Published var passcode: String = UserDefaults.standard.string(forKey: "pkgPasscode") ?? "" {
+        didSet { credentialsChanged() }
+    }
+    /// 64 hex characters: content key seed + SELF key seed. Empty = none.
+    @Published var ekc: String = UserDefaults.standard.string(forKey: "pkgEKC") ?? "" {
+        didSet { credentialsChanged() }
+    }
+
+    private func credentialsChanged() {
+        UserDefaults.standard.set(passcode, forKey: "pkgPasscode")
+        UserDefaults.standard.set(ekc, forKey: "pkgEKC")
+        listCache.removeAll()   // a cached listing was decrypted with the old keys
+    }
+
+    private static func normalizedEKC(_ raw: String) -> String {
+        var t = raw.filter { !$0.isWhitespace }
+        if t.lowercased().hasPrefix("0x") { t.removeFirst(2) }
+        return t
+    }
+
+    /// Pushes the saved passcode / EKC into the C layer.
+    /// Returns an error message if either value is malformed.
+    nonisolated private static func applyCredentials(passcode: String, ekc: String) -> String? {
+        let rc = pkg_ios_set_credentials(passcode, normalizedEKC(ekc))
+        return rc == 0 ? nil : String(cString: pkg_ios_last_error())
+    }
+
     // ── Saved selections per PKG path ─────────────────────────────────
     private var savedSelections: [String: Set<String>] = [:]
 
@@ -87,9 +116,20 @@ class ExtractionManager: ObservableObject {
 
         let pkgPath  = pkgURL.path
         let cfgPath  = configPath
+        let pass     = passcode
+        let ekcValue = ekc
         let selfPtr  = Unmanaged.passRetained(self).toOpaque()
 
         Task.detached(priority: .userInitiated) {
+            if let credErr = ExtractionManager.applyCredentials(passcode: pass, ekc: ekcValue) {
+                Unmanaged<ExtractionManager>.fromOpaque(selfPtr).release()
+                await MainActor.run {
+                    self.listError = credErr
+                    self.isListing = false
+                }
+                return
+            }
+
             let collector = FileEntryCollector()
             let collectorPtr = Unmanaged.passRetained(collector).toOpaque()
 
@@ -177,6 +217,8 @@ class ExtractionManager: ObservableObject {
         let pkgPath  = pkgURL.path
         let outPath  = outDir.path
         let cfgPath  = configPath
+        let pass     = passcode
+        let ekcValue = ekc
         let selfPtr  = Unmanaged.passRetained(self).toOpaque()
 
         let filterList: [String]? = selectedFiles.flatMap { $0.isEmpty ? nil : Array($0) }
@@ -191,6 +233,19 @@ class ExtractionManager: ObservableObject {
         }
 
         Task.detached(priority: .userInitiated) {
+
+            if let credErr = ExtractionManager.applyCredentials(passcode: pass, ekc: ekcValue) {
+                Unmanaged<ExtractionManager>.fromOpaque(selfPtr).release()
+                await MainActor.run {
+                    self.isExtracting = false
+                    self.finished     = true
+                    self.lastError    = credErr
+                }
+                if bgTask != .invalid {
+                    await UIApplication.shared.endBackgroundTask(bgTask)
+                }
+                return
+            }
 
             let result: Int32
 

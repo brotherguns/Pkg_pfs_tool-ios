@@ -24,6 +24,9 @@ struct ContentView: View {
     @State private var pickerPKG:      URL?           = nil
     @State private var selectedFiles:  Set<String>   = []
 
+    // Decryption keys sheet
+    @State private var showKeys = false
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
@@ -87,6 +90,12 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
+                    Button { showKeys = true } label: {
+                        Image(systemName: "key.fill")
+                    }
+                    .disabled(manager.isExtracting || manager.isListing)
+                }
+                ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: refreshList) {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -131,6 +140,10 @@ struct ContentView: View {
                         selectedPKG    = nil
                     }
                 }
+            }
+            // ── Decryption keys sheet ──────────────────────────────────
+            .sheet(isPresented: $showKeys) {
+                KeysSheet(manager: manager)
             }
             // ── Crash log sheet ────────────────────────────────────────
             .sheet(isPresented: $showCrashLog) {
@@ -282,6 +295,65 @@ struct ContentView: View {
     private func startExtraction(url: URL, files: Set<String>) {
         manager.saveSelection(files, for: url)
         manager.extract(pkgURL: url, selectedFiles: files.isEmpty ? nil : files)
+    }
+}
+
+// ── Passcode / EKC entry ────────────────────────────────────────────────────
+struct KeysSheet: View {
+    @ObservedObject var manager: ExtractionManager
+    @Environment(\.dismiss) private var dismiss
+
+    var body: some View {
+        NavigationView {
+            Form {
+                Section(
+                    header: Text("Passcode"),
+                    footer: Text("32 characters. Leave empty to use the default (32 zeros).")
+                ) {
+                    TextField("00000000000000000000000000000000", text: $manager.passcode)
+                        .font(.system(.body, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                    if !manager.passcode.isEmpty && manager.passcode.count != 32 {
+                        Text("\(manager.passcode.count)/32 characters")
+                            .font(.caption).foregroundColor(.orange)
+                    }
+                }
+                Section(
+                    header: Text("EKC"),
+                    footer: Text("64 hex characters: content key seed followed by SELF key seed. Needed for finalized game-data packages.")
+                ) {
+                    TextField("Content key seed + SELF key seed", text: $manager.ekc)
+                        .font(.system(.body, design: .monospaced))
+                        .textInputAutocapitalization(.never)
+                        .disableAutocorrection(true)
+                    if !manager.ekc.isEmpty && !ekcLooksValid {
+                        Text("Expected 64 hex characters")
+                            .font(.caption).foregroundColor(.orange)
+                    }
+                }
+                Section {
+                    Button("Clear both", role: .destructive) {
+                        manager.passcode = ""
+                        manager.ekc      = ""
+                    }
+                    .disabled(manager.passcode.isEmpty && manager.ekc.isEmpty)
+                }
+            }
+            .navigationTitle("Decryption Keys")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+    }
+
+    private var ekcLooksValid: Bool {
+        var t = manager.ekc.filter { !$0.isWhitespace }
+        if t.lowercased().hasPrefix("0x") { t.removeFirst(2) }
+        return t.count == 64 && t.allSatisfy { $0.isHexDigit }
     }
 }
 

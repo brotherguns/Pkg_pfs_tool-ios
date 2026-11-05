@@ -110,7 +110,65 @@ const char* pkg_ios_last_error(void) {
 }
 
 /* ------------------------------------------------------------------ */
-/* PFS options callback (mirrors --passcode 000...000 from main.c)    */
+/* User-supplied credentials (passcode / EKC)                          */
+/* ------------------------------------------------------------------ */
+
+static char    s_user_passcode[KEYMGR_PASSCODE_SIZE];
+static int     s_has_user_passcode = 0;
+static uint8_t s_user_ekc[KEYMGR_CONTENT_KEY_SIZE + KEYMGR_SELF_KEY_SIZE];
+static int     s_has_user_ekc = 0;
+
+static int hex_nibble(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+int pkg_ios_set_credentials(const char* passcode, const char* ekc_hex) {
+    s_has_user_passcode = 0;
+    s_has_user_ekc      = 0;
+
+    if (passcode && passcode[0]) {
+        if (strlen(passcode) != KEYMGR_PASSCODE_SIZE) {
+            set_error("Passcode must be exactly 32 characters.");
+            return -1;
+        }
+        memcpy(s_user_passcode, passcode, sizeof(s_user_passcode));
+        s_has_user_passcode = 1;
+    }
+
+    if (ekc_hex && ekc_hex[0]) {
+        if (strlen(ekc_hex) != sizeof(s_user_ekc) * 2) {
+            set_error("EKC must be 64 hex characters (content key seed + SELF key seed).");
+            s_has_user_passcode = 0;
+            return -1;
+        }
+        for (size_t i = 0; i < sizeof(s_user_ekc); i++) {
+            int hi = hex_nibble(ekc_hex[i * 2]);
+            int lo = hex_nibble(ekc_hex[i * 2 + 1]);
+            if (hi < 0 || lo < 0) {
+                set_error("EKC contains non-hex characters.");
+                s_has_user_passcode = 0;
+                return -1;
+            }
+            s_user_ekc[i] = (uint8_t)((hi << 4) | lo);
+        }
+        s_has_user_ekc = 1;
+    }
+    return 0;
+}
+
+/* Copy the user's EKC seeds into a title keyset. */
+static void apply_user_ekc(struct keymgr_title_keyset* keyset) {
+    memcpy(keyset->content_key_seed, s_user_ekc, KEYMGR_CONTENT_KEY_SIZE);
+    memcpy(keyset->self_key_seed, s_user_ekc + KEYMGR_CONTENT_KEY_SIZE, KEYMGR_SELF_KEY_SIZE);
+    keyset->flags.has_content_key_seed = 1;
+    keyset->flags.has_self_key_seed    = 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* PFS options callback (--passcode from main.c, default all zeros)    */
 /* ------------------------------------------------------------------ */
 
 static int s_callback_count = 0;
@@ -123,9 +181,16 @@ static int ios_set_pfs_options(void* arg, struct pkg* pkg, struct pfs_options* o
     DIAG("  pkg=%p  opts->keyset=%p", (void*)pkg, (void*)opts->keyset);
 
     if (opts->keyset) {
-        memset(opts->keyset->passcode, '0', sizeof(opts->keyset->passcode));
-        opts->keyset->flags.has_passcode = 1;
-        DIAG("  -> Applied zero passcode");
+        if (s_has_user_passcode) {
+            memcpy(opts->keyset->passcode, s_user_passcode, sizeof(opts->keyset->passcode));
+            opts->keyset->flags.has_passcode = 1;
+            DIAG("  -> Applied user passcode");
+        } else if (!s_has_user_ekc) {
+            /* An EKC derives the image key itself; a zero passcode would override it. */
+            memset(opts->keyset->passcode, '0', sizeof(opts->keyset->passcode));
+            opts->keyset->flags.has_passcode = 1;
+            DIAG("  -> Applied zero passcode");
+        }
     } else {
         DIAG("  keyset is NULL -> leaving for pkg_alloc to create");
     }
@@ -219,12 +284,25 @@ static int pkg_open(const char* pkg_path, const char* config_path,
         return -1;
     }
 
+    /*
+     * Pre-register a keyset carrying the EKC seeds.  pkg_alloc then takes its
+     * "found keyset" path and runs setup_keyset_by_image_key() with the seeds
+     * in place, which is what decrypts the EKPFS of finalized GD packages.
+     */
+    if (s_has_user_ekc) {
+        struct keymgr_title_keyset* ks = keymgr_alloc_title_keyset(content_id, 1);
+        if (ks) {
+            apply_user_ekc(ks);
+            DIAG("Registered user EKC for \"%s\"", content_id);
+        }
+    }
+
     *pkg_out = pkg_alloc(pkg_path, ios_set_pfs_options, NULL);
     if (!*pkg_out) {
         char errbuf[2048];
         snprintf(errbuf, sizeof(errbuf),
                  "pkg_alloc failed for: %s\n"
-                 "Possible causes: wrong passcode, missing keys, corrupt PKG.",
+                 "Possible causes: wrong passcode/EKC, missing keys, corrupt PKG.",
                  content_id[0] ? content_id : "(unknown)");
         set_error(errbuf);
         append_warn_log_to_error();

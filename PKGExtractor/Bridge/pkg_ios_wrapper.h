@@ -22,6 +22,18 @@ typedef void (*pkg_ios_progress_cb)(void* ctx, const char* path);
 typedef void (*pkg_ios_list_cb)(void* ctx, const char* path, uint64_t size, int is_dir);
 
 /**
+ * Set the decryption credentials used by all following list/extract calls.
+ * Pass NULL or "" to leave a value unset.
+ *
+ * @param passcode  exactly 32 characters; unset falls back to 32 x '0'
+ * @param ekc_hex   64 hex characters: content key seed (16 bytes) followed
+ *                  by SELF key seed (16 bytes); used for finalized GD packages
+ *
+ * @return  0 on success, -1 if a value is malformed (see pkg_ios_last_error()).
+ */
+int pkg_ios_set_credentials(const char* passcode, const char* ekc_hex);
+
+/**
  * Extract a PS4 PKG file to a directory.
  *
  * @param pkg_path     absolute path to the .pkg file
