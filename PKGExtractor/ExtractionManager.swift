@@ -43,7 +43,7 @@ class ExtractionManager: ObservableObject {
         listCache.removeAll()   // a cached listing was decrypted with the old keys
     }
 
-    private static func normalizedEKC(_ raw: String) -> String {
+    nonisolated private static func normalizedEKC(_ raw: String) -> String {
         var t = raw.filter { !$0.isWhitespace }
         if t.lowercased().hasPrefix("0x") { t.removeFirst(2) }
         return t
