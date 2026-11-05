@@ -24,8 +24,8 @@ struct ContentView: View {
     @State private var pickerPKG:      URL?           = nil
     @State private var selectedFiles:  Set<String>   = []
 
-    // Decryption keys sheet
-    @State private var showKeys = false
+    // Per-PKG passcode / EKC prompt (shown when default keys fail)
+    @State private var keyPromptPKG: URL? = nil
 
     var body: some View {
         NavigationView {
@@ -90,12 +90,6 @@ struct ContentView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button { showKeys = true } label: {
-                        Image(systemName: "key.fill")
-                    }
-                    .disabled(manager.isExtracting || manager.isListing)
-                }
-                ToolbarItem(placement: .navigationBarTrailing) {
                     Button(action: refreshList) {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -142,8 +136,23 @@ struct ContentView: View {
                 }
             }
             // ── Decryption keys sheet ──────────────────────────────────
-            .sheet(isPresented: $showKeys) {
-                KeysSheet(manager: manager)
+            .sheet(item: $keyPromptPKG) { pkg in
+                KeysSheet(pkg: pkg, manager: manager) {
+                    keyPromptPKG = nil
+                    beginFilePicking(url: pkg)
+                } onCancel: {
+                    keyPromptPKG = nil
+                    selectedPKG  = nil
+                }
+            }
+            // Listing failed to decrypt -> close the picker and ask for keys for this PKG
+            .onChange(of: manager.listError) { err in
+                guard err != nil, let pkg = pickerPKG, showFilePicker else { return }
+                showFilePicker = false
+                pickerPKG      = nil
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                    keyPromptPKG = pkg
+                }
             }
             // ── Crash log sheet ────────────────────────────────────────
             .sheet(isPresented: $showCrashLog) {
@@ -298,24 +307,38 @@ struct ContentView: View {
     }
 }
 
-// ── Passcode / EKC entry ────────────────────────────────────────────────────
+// ── Per-PKG passcode / EKC prompt ───────────────────────────────────────────
+extension URL: Identifiable {
+    public var id: String { absoluteString }
+}
+
 struct KeysSheet: View {
+    let pkg: URL
     @ObservedObject var manager: ExtractionManager
-    @Environment(\.dismiss) private var dismiss
+    let onRetry:  () -> Void
+    let onCancel: () -> Void
+
+    @State private var creds = ExtractionManager.Credentials()
 
     var body: some View {
         NavigationView {
             Form {
+                Section(footer: Text("The default keys could not decrypt \(pkg.lastPathComponent). Enter its passcode or EKC and retry.")) {
+                    if let err = manager.listError {
+                        Text(err.components(separatedBy: "\n").first ?? err)
+                            .font(.caption).foregroundColor(.red)
+                    }
+                }
                 Section(
                     header: Text("Passcode"),
                     footer: Text("32 characters. Leave empty to use the default (32 zeros).")
                 ) {
-                    TextField("00000000000000000000000000000000", text: $manager.passcode)
+                    TextField("00000000000000000000000000000000", text: $creds.passcode)
                         .font(.system(.body, design: .monospaced))
                         .textInputAutocapitalization(.never)
                         .disableAutocorrection(true)
-                    if !manager.passcode.isEmpty && manager.passcode.count != 32 {
-                        Text("\(manager.passcode.count)/32 characters")
+                    if !creds.passcode.isEmpty && creds.passcode.count != 32 {
+                        Text("\(creds.passcode.count)/32 characters")
                             .font(.caption).foregroundColor(.orange)
                     }
                 }
@@ -323,35 +346,36 @@ struct KeysSheet: View {
                     header: Text("EKC"),
                     footer: Text("64 hex characters: content key seed followed by SELF key seed. Needed for finalized game-data packages.")
                 ) {
-                    TextField("Content key seed + SELF key seed", text: $manager.ekc)
+                    TextField("Content key seed + SELF key seed", text: $creds.ekc)
                         .font(.system(.body, design: .monospaced))
                         .textInputAutocapitalization(.never)
                         .disableAutocorrection(true)
-                    if !manager.ekc.isEmpty && !ekcLooksValid {
+                    if !creds.ekc.isEmpty && !ekcLooksValid {
                         Text("Expected 64 hex characters")
                             .font(.caption).foregroundColor(.orange)
                     }
                 }
-                Section {
-                    Button("Clear both", role: .destructive) {
-                        manager.passcode = ""
-                        manager.ekc      = ""
-                    }
-                    .disabled(manager.passcode.isEmpty && manager.ekc.isEmpty)
-                }
             }
-            .navigationTitle("Decryption Keys")
+            .navigationTitle("Keys Required")
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel", action: onCancel)
+                }
                 ToolbarItem(placement: .confirmationAction) {
-                    Button("Done") { dismiss() }
+                    Button("Retry") {
+                        manager.setCredentials(creds, for: pkg)
+                        onRetry()
+                    }
+                    .disabled(creds.passcode.isEmpty && creds.ekc.isEmpty)
                 }
             }
+            .onAppear { creds = manager.credentials(for: pkg) }
         }
     }
 
     private var ekcLooksValid: Bool {
-        var t = manager.ekc.filter { !$0.isWhitespace }
+        var t = creds.ekc.filter { !$0.isWhitespace }
         if t.lowercased().hasPrefix("0x") { t.removeFirst(2) }
         return t.count == 64 && t.allSatisfy { $0.isHexDigit }
     }

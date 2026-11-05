@@ -27,20 +27,31 @@ class ExtractionManager: ObservableObject {
     // ── SELF conversion state ─────────────────────────────────────────
     @Published var elfConversionResult: String? = nil
 
-    // ── Decryption credentials (persisted) ────────────────────────────
-    /// 32-character passcode. Empty = default (all zeros).
-    @Published var passcode: String = UserDefaults.standard.string(forKey: "pkgPasscode") ?? "" {
-        didSet { credentialsChanged() }
-    }
-    /// 64 hex characters: content key seed + SELF key seed. Empty = none.
-    @Published var ekc: String = UserDefaults.standard.string(forKey: "pkgEKC") ?? "" {
-        didSet { credentialsChanged() }
+    // ── Decryption credentials (persisted, per PKG file name) ─────────
+    struct Credentials: Codable, Equatable {
+        var passcode = ""   // 32 characters, empty = default (all zeros)
+        var ekc      = ""   // 64 hex characters, empty = none
     }
 
-    private func credentialsChanged() {
-        UserDefaults.standard.set(passcode, forKey: "pkgPasscode")
-        UserDefaults.standard.set(ekc, forKey: "pkgEKC")
-        listCache.removeAll()   // a cached listing was decrypted with the old keys
+    private static let credsKey = "pkgCredentials"
+    private var credentials: [String: Credentials] = {
+        guard let data = UserDefaults.standard.data(forKey: ExtractionManager.credsKey),
+              let dict = try? JSONDecoder().decode([String: Credentials].self, from: data)
+        else { return [:] }
+        return dict
+    }()
+
+    func credentials(for pkgURL: URL) -> Credentials {
+        credentials[pkgURL.lastPathComponent] ?? Credentials()
+    }
+
+    func setCredentials(_ creds: Credentials, for pkgURL: URL) {
+        let name = pkgURL.lastPathComponent
+        if creds == Credentials() { credentials.removeValue(forKey: name) } else { credentials[name] = creds }
+        if let data = try? JSONEncoder().encode(credentials) {
+            UserDefaults.standard.set(data, forKey: ExtractionManager.credsKey)
+        }
+        listCache.removeValue(forKey: pkgURL.path)   // cached listing used the old keys
     }
 
     nonisolated private static func normalizedEKC(_ raw: String) -> String {
@@ -116,8 +127,9 @@ class ExtractionManager: ObservableObject {
 
         let pkgPath  = pkgURL.path
         let cfgPath  = configPath
-        let pass     = passcode
-        let ekcValue = ekc
+        let creds    = credentials(for: pkgURL)
+        let pass     = creds.passcode
+        let ekcValue = creds.ekc
         let selfPtr  = Unmanaged.passRetained(self).toOpaque()
 
         Task.detached(priority: .userInitiated) {
@@ -217,8 +229,9 @@ class ExtractionManager: ObservableObject {
         let pkgPath  = pkgURL.path
         let outPath  = outDir.path
         let cfgPath  = configPath
-        let pass     = passcode
-        let ekcValue = ekc
+        let creds    = credentials(for: pkgURL)
+        let pass     = creds.passcode
+        let ekcValue = creds.ekc
         let selfPtr  = Unmanaged.passRetained(self).toOpaque()
 
         let filterList: [String]? = selectedFiles.flatMap { $0.isEmpty ? nil : Array($0) }
