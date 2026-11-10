@@ -394,6 +394,64 @@ static enum cb_result ios_list_pre_cb(void* arg, const char* path,
 }
 
 /* ------------------------------------------------------------------ */
+/* SC0 entries (param.sfo, icons, etc. + extra entries)                */
+/* Mirrors pkg_unpack_sc_entries_cb in pkg_pfs_tool main.c, but is      */
+/* best-effort: any entry that can't be read/decrypted is skipped      */
+/* instead of aborting the whole extraction.                            */
+/* ------------------------------------------------------------------ */
+
+struct ios_sc_ctx {
+    const char* output_directory;   /* "<out>/Sc0/" */
+    int         extracted;
+};
+
+static enum cb_result ios_unpack_sc_entry_cb(void* arg, struct pkg* pkg,
+                                             struct pkg_entry_desc* desc) {
+    struct ios_sc_ctx* ctx = (struct ios_sc_ctx*)arg;
+    char file_path[4096], directory[4096];
+    struct pkg_entry_keyset keyset;
+    uint8_t* out = NULL;
+    uint8_t* data;
+    uint32_t data_size, data_size_aligned;
+    uint64_t data_offset;
+
+    if (!ctx || !pkg || !desc) return CB_RESULT_CONTINUE;
+
+    data = pkg_locate_entry_data(pkg, desc->id, &data_offset, &data_size);
+    if (!data || data_size == 0) return CB_RESULT_CONTINUE;
+
+    if (desc->is_encrypted || desc->use_new_algo) {
+        if (!pkg_get_entry_keyset(pkg, desc->id, &keyset)) {
+            DIAG("  SC entry '%s': no key, skipping", desc->name);
+            return CB_RESULT_CONTINUE;
+        }
+    }
+
+    snprintf(file_path, sizeof(file_path), "%s%s", ctx->output_directory, desc->name);
+    path_get_directory(directory, sizeof(directory), file_path);
+    if (*directory != '\0') make_directories(directory, 0755);
+
+    data_size_aligned = align_up_32(data_size, 16);
+    out = (uint8_t*)calloc(1, data_size_aligned);
+    if (!out) return CB_RESULT_CONTINUE;
+
+    if (desc->use_new_algo)
+        aes_decrypt_oex(keyset.key, sizeof(keyset.key), data_offset, data, out, data_size);
+    else if (desc->is_encrypted)
+        aes_decrypt_cbc_cts(keyset.key, sizeof(keyset.key), keyset.iv, data, out, data_size_aligned);
+    else
+        memcpy(out, data, data_size);
+
+    if (write_to_file(file_path, out, data_size, NULL, 0644))
+        ctx->extracted++;
+    else
+        DIAG("  SC entry '%s': write failed", desc->name);
+
+    free(out);
+    return CB_RESULT_CONTINUE;
+}
+
+/* ------------------------------------------------------------------ */
 /* Internal core that does the actual work                             */
 /* ------------------------------------------------------------------ */
 
@@ -490,6 +548,21 @@ static int pkg_ios_run(
         } else {
             DIAG("pfs_unpack_all OK");
             ret = 0;
+
+            /* Also extract the PKG's own SC entries (+ extras) into <out>/Sc0/.
+             * Best-effort: never turns a successful Image0 extraction into a failure.
+             * Skipped when a file filter is active (partial extraction). */
+            if (filter_count == 0) {
+                char sc_dir[4096];
+                snprintf(sc_dir, sizeof(sc_dir), "%s/Sc0/", output_dir);
+                mkdir_p(sc_dir);
+
+                struct ios_sc_ctx sc_ctx;
+                sc_ctx.output_directory = sc_dir;
+                sc_ctx.extracted = 0;
+                pkg_enum_entries(pkg, &ios_unpack_sc_entry_cb, &sc_ctx, 1 /* need_extra */);
+                DIAG("SC entries extracted: %d", sc_ctx.extracted);
+            }
         }
     }
 
