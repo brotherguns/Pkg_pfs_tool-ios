@@ -224,7 +224,7 @@ class ExtractionManager: ObservableObject {
         let docs   = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
         let outDir = docs
             .appendingPathComponent("Extracted")
-            .appendingPathComponent(pkgURL.deletingPathExtension().lastPathComponent)
+            .appendingPathComponent(PKGSplit.outputName(for: pkgURL))
 
         let pkgPath  = pkgURL.path
         let outPath  = outDir.path
@@ -367,6 +367,64 @@ class ExtractionManager: ObservableObject {
         } catch {
             return "eboot.elf conversion failed: \(error.localizedDescription)"
         }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// MARK: – PKGSplit  (split PKGs: name_0.pkg, name_1.pkg, …)
+// ─────────────────────────────────────────────────────────────────────
+
+/// A split PKG is the plain byte-wise pieces of one package.  The C layer opens
+/// the whole set from the path of any part, so the rest of the app keeps using a
+/// single URL; this only helps the UI group the parts and name the output.
+enum PKGSplit {
+
+    struct Info {
+        let parts: Int
+        let totalSize: UInt64
+        let isComplete: Bool
+    }
+
+    /// Non-nil when `url` belongs to a split PKG.
+    static func info(for url: URL) -> Info? {
+        var parts: Int32 = 1
+        var total: UInt64 = 0
+        var complete: Int32 = 1
+        guard pkg_ios_split_info(url.path, &parts, &total, &complete) != 0 else { return nil }
+        return Info(parts: Int(parts), totalSize: total, isComplete: complete != 0)
+    }
+
+    /// `name_003.pkg` -> (prefix "name", digits "003")
+    private static func parse(_ fileName: String) -> (prefix: String, digits: String, ext: String)? {
+        let ns = fileName as NSString
+        let stem = ns.deletingPathExtension
+        guard let r = stem.range(of: "_[0-9]+$", options: .regularExpression) else { return nil }
+        let digits = String(stem[stem.index(after: r.lowerBound)...])
+        return (String(stem[..<r.lowerBound]), digits, ns.pathExtension)
+    }
+
+    /// Name-only check: `name_N.pkg` (N > 0) whose `name_0.pkg` is in `names`.
+    /// Callers must also confirm the file belongs to a real split set (`info(for:)`).
+    static func isContinuationPart(_ fileName: String, among names: Set<String>) -> Bool {
+        guard let p = parse(fileName) else { return false }
+        // zero-padded numbering (name_00, name_01, …) keeps its width
+        let padded = p.digits.count > 1 && p.digits.hasPrefix("0")
+        let zero = padded ? String(repeating: "0", count: p.digits.count) : "0"
+        if p.digits == zero { return false }
+        return names.contains("\(p.prefix)_\(zero).\(p.ext)")
+    }
+
+    /// Name for the output folder: `name_0.pkg` -> `name` (plain PKGs keep their stem).
+    static func outputName(for url: URL) -> String {
+        let stem = url.deletingPathExtension().lastPathComponent
+        guard info(for: url) != nil, let p = parse(url.lastPathComponent) else { return stem }
+        return p.prefix
+    }
+
+    /// Errors the C layer raises for a split set with missing / truncated parts.
+    /// They are not key problems, so the UI must not ask for a passcode.
+    static func isIncompleteError(_ message: String) -> Bool {
+        message.hasPrefix("Incomplete split PKG")
     }
 }
 

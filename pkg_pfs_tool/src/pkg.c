@@ -927,45 +927,88 @@ error:
 	return status;
 }
 
-static int get_pkg_total_size(const char* file_path, uint64_t* size) {
-	struct file_map* map = NULL;
-	struct pkg_header hdr_buf;
-	struct pkg_header* hdr;
-	int status = 0;
+/* Upper bound for buffering the metadata region in pread mode. */
+#define PKG_MAX_BUFFERED_REGION (UINT64_C(256) << 20)
 
-	map = map_file(file_path);
-	if (!map)
-		goto error;
+static const uint8_t s_pkg_magic[4] = { 0x7F, 'C', 'N', 'T' };
 
-	if (map->use_pread) {
-		if (!map_pread(map, &hdr_buf, sizeof(hdr_buf), 0))
-			goto error;
-		hdr = &hdr_buf;
-	} else {
-		hdr = (struct pkg_header*)map->data;
-	}
-
-	if (size)
-		*size = BE64(hdr->pfs_image_offset) + BE64(hdr->pfs_image_size);
-
-	status = 1;
-
-error:
-	if (map)
-		unmap_file(map);
-
-	return status;
+static void build_piece_path(char* out, size_t out_size, const char* prefix, const char* suffix, unsigned int width, unsigned int index) {
+	snprintf(out, out_size, "%s%0*u%s", prefix, (int)width, index, suffix);
 }
 
-static inline int get_pkg_piece_count(const char* file_path, size_t* count) {
-	uint64_t size;
-	const uint64_t piece_size = (uint64_t)(UINT32_MAX) + 1;
+void pkg_free_piece_set(struct pkg_piece_set* set) {
+	size_t i;
 
-	if (!get_pkg_total_size(file_path, &size))
+	if (!set)
+		return;
+
+	if (set->paths) {
+		for (i = 0; i < set->count; ++i)
+			free(set->paths[i]);
+		free(set->paths);
+	}
+
+	memset(set, 0, sizeof(*set));
+}
+
+int pkg_find_pieces(const char* prefix, const char* suffix, unsigned int width, struct pkg_piece_set* set) {
+	struct pkg_header hdr;
+	struct stat64 st;
+	char path[PATH_MAX];
+	char** paths;
+	size_t capacity = 0;
+	unsigned int index;
+	ssize_t n;
+	int fd;
+
+	assert(prefix != NULL);
+	assert(suffix != NULL);
+	assert(set != NULL);
+
+	memset(set, 0, sizeof(*set));
+
+	/* Piece 0 holds the header, which says how large the whole package is. */
+	build_piece_path(path, sizeof(path), prefix, suffix, width, 0);
+	fd = open(path, O_RDONLY | O_LARGEFILE | O_BINARY);
+	if (fd < 0)
+		return 0;
+	n = pread(fd, &hdr, sizeof(hdr), 0);
+	close(fd);
+	if (n != (ssize_t)sizeof(hdr) || memcmp(hdr.magic, s_pkg_magic, sizeof(s_pkg_magic)) != 0)
 		return 0;
 
-	if (count)
-		*count = (size + piece_size - 1) / piece_size;
+	set->required_size = BE64(hdr.pfs_image_offset) + BE64(hdr.pfs_image_size);
+
+	/*
+	 * Take pieces in order until they cover the package.  Piece sizes are read from the
+	 * files themselves, so no particular split size is assumed.
+	 */
+	for (index = 0; index == 0 || set->total_size < set->required_size; ++index) {
+		build_piece_path(path, sizeof(path), prefix, suffix, width, index);
+		if (stat64(path, &st) < 0 || !S_ISREG(st.st_mode))
+			break;
+
+		if (set->count == capacity) {
+			capacity = capacity ? capacity * 2 : 8;
+			paths = (char**)realloc(set->paths, capacity * sizeof(*paths));
+			if (!paths) {
+				pkg_free_piece_set(set);
+				return 0;
+			}
+			set->paths = paths;
+		}
+
+		set->paths[set->count] = strdup(path);
+		if (!set->paths[set->count]) {
+			pkg_free_piece_set(set);
+			return 0;
+		}
+
+		++set->count;
+		set->total_size += (uint64_t)st.st_size;
+	}
+
+	set->complete = set->total_size >= set->required_size;
 
 	return 1;
 }
@@ -992,69 +1035,106 @@ static enum cb_result entry_check_cb(void* arg, struct pkg* pkg, struct pkg_entr
 }
 
 struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_options_cb, void* set_pfs_options_cb_arg) {
+	struct pkg_piece_set set;
+	struct stat64 st;
+	struct pkg* pkg;
+	char prefix[PATH_MAX];
+	const char* p;
+
+	assert(file_path != NULL);
+
+	/* No '%', or a real file that just has one in its name: a single, whole PKG. */
+	p = strrchr(file_path, '%');
+	if (!p || stat64(file_path, &st) == 0)
+		return pkg_alloc_pieces(&file_path, 1, set_pfs_options_cb, set_pfs_options_cb_arg);
+
+	if ((size_t)(p - file_path) >= sizeof(prefix))
+		return NULL;
+	memcpy(prefix, file_path, (size_t)(p - file_path));
+	prefix[p - file_path] = '\0';
+
+	if (!pkg_find_pieces(prefix, p + 1, 0, &set)) {
+		warning("Unable to find the first piece of the split PKG (or it is not a PKG): %s", file_path);
+		return NULL;
+	}
+
+	if (!set.complete) {
+		warning("Split PKG is incomplete: found %zu piece(s) with %" PRIu64 " bytes, need %" PRIu64 " bytes: %s",
+		        set.count, set.total_size, set.required_size, file_path);
+		pkg_free_piece_set(&set);
+		return NULL;
+	}
+
+	pkg = pkg_alloc_pieces((const char* const*)set.paths, set.count, set_pfs_options_cb, set_pfs_options_cb_arg);
+	pkg_free_piece_set(&set);
+
+	return pkg;
+}
+
+struct pkg* pkg_alloc_pieces(const char* const* file_paths, size_t file_count, pkg_set_pfs_options_cb set_pfs_options_cb, void* set_pfs_options_cb_arg) {
 	struct pkg* pkg = NULL;
 	struct pfs_options pfs_opts;
 	uint8_t content_id_digest[PFS_HASH_SIZE];
-	char** file_paths = NULL;
-	size_t file_count = 0;
-	char piece_file_path[PATH_MAX];
-	char piece_file_path_fmt[PATH_MAX];
 	struct entry_check_cb_args entry_check_args;
-	char* p;
-	size_t i;
 
-	assert(file_path != NULL);
+	assert(file_paths != NULL);
+	assert(file_count > 0);
 
 	pkg = (struct pkg*)malloc(sizeof(*pkg));
 	if (!pkg)
 		goto error;
 	memset(pkg, 0, sizeof(*pkg));
 
-	strncpy(piece_file_path, file_path, sizeof(piece_file_path));
-	p = strrchr(piece_file_path, '%');
-	if (p) {
-		*p = '\0';
-		snprintf(piece_file_path_fmt, sizeof(piece_file_path_fmt), "%s%%u%s", piece_file_path, p + 1);
-
-		snprintf(piece_file_path, sizeof(piece_file_path), piece_file_path_fmt, 0);
-		if (!get_pkg_piece_count(piece_file_path, &file_count) || file_count == 0)
-			goto error;
-
-		file_paths = (char**)malloc(file_count * sizeof(*file_paths));
-		if (!file_paths)
-			goto error;
-		memset(file_paths, 0, file_count * sizeof(*file_paths));
-
-		for (i = 0; i < file_count; ++i) {
-			snprintf(piece_file_path, sizeof(piece_file_path), piece_file_path_fmt, (unsigned int)i);
-			file_paths[i] = strdup(piece_file_path);
-			if (!file_paths[i])
-				goto error;
-		}
-
-		pkg->map = map_files((const char* const*)file_paths, file_count);
-	} else {
-		pkg->map = map_file(file_path);
-	}
-
-	if (!pkg->map)
+	pkg->map = map_files(file_paths, file_count);
+	if (!pkg->map) {
+		warning("Unable to open PKG (%zu file%s, first: %s): %s", file_count, file_count == 1 ? "" : "s",
+		        file_paths[0], strerror(errno));
 		goto error;
+	}
 
 	if (pkg->map->use_pread) {
 		/*
-		 * pread-mode: the file is too large to mmap on iOS.
-		 * Allocate a buffer for the PKG header (first PKG_HEADER_SIZE bytes)
-		 * and pread it once.  All subsequent I/O goes through map_pread().
+		 * pread-mode (very large file or split PKG on iOS): nothing is mapped.
+		 * The entry table and entry data are read in place from pkg->hdr, so
+		 * buffer the whole metadata region in front of the PFS image instead of
+		 * just the fixed-size header.  All PFS I/O goes through map_pread().
 		 */
-		pkg->hdr = (struct pkg_header*)malloc(PKG_HEADER_SIZE);
-		if (!pkg->hdr)
+		uint64_t region = PKG_HEADER_SIZE;
+		uint64_t pfs_off;
+		uint8_t* buf;
+
+		buf = (uint8_t*)malloc(PKG_HEADER_SIZE);
+		if (!buf)
 			goto error;
+		if (!map_pread(pkg->map, buf, PKG_HEADER_SIZE, 0)) {
+			free(buf);
+			goto error;
+		}
+
+		pfs_off = BE64(((struct pkg_header*)buf)->pfs_image_offset);
+		if (pfs_off > PKG_HEADER_SIZE && pfs_off <= pkg->map->size && pfs_off <= PKG_MAX_BUFFERED_REGION) {
+			uint8_t* grown = (uint8_t*)realloc(buf, (size_t)pfs_off);
+			if (!grown) {
+				free(buf);
+				goto error;
+			}
+			buf = grown;
+			if (!map_pread(pkg->map, buf + PKG_HEADER_SIZE, pfs_off - PKG_HEADER_SIZE, PKG_HEADER_SIZE)) {
+				free(buf);
+				goto error;
+			}
+			region = pfs_off;
+		} else {
+			warning("pkg_alloc: PFS image offset 0x%" PRIX64 " is not usable as metadata region; entry data past the header will be unavailable", pfs_off);
+		}
+
+		pkg->hdr = (struct pkg_header*)buf;
 		pkg->hdr_owned = 1;
-		if (!map_pread(pkg->map, pkg->hdr, PKG_HEADER_SIZE, 0))
-			goto error;
+		pkg->hdr_size = region;
 	} else {
 		pkg->hdr = (struct pkg_header*)pkg->map->data;
 		pkg->hdr_owned = 0;
+		pkg->hdr_size = pkg->map->size;
 	}
 
 	pkg->entry_table = (struct pkg_table_entry*)((uint8_t*)pkg->hdr + BE32(pkg->hdr->entry_table_offset));
@@ -1062,12 +1142,24 @@ struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_opti
 	pkg->sc_entry_count = BE16(pkg->hdr->sc_entry_count);
 	pkg->finalized = (BE32(pkg->hdr->flags) & PKG_FLAGS_FINALIZED) != 0 ? 1 : 0;
 
+	if ((uint64_t)BE32(pkg->hdr->entry_table_offset) + (uint64_t)pkg->entry_count * PKG_TABLE_ENTRY_SIZE > pkg->hdr_size) {
+		warning("pkg_alloc: entry table (offset 0x%" PRIX32 ", %zu entries) lies outside of the PKG metadata region (0x%" PRIX64 " bytes)",
+		        BE32(pkg->hdr->entry_table_offset), pkg->entry_count, pkg->hdr_size);
+		goto error;
+	}
+
 	memset(content_id_digest, 0, sizeof(content_id_digest));
 	sha256_buffer(pkg->hdr->content_id, sizeof(pkg->hdr->content_id), content_id_digest);
 
 	pkg->pfs_image_offset = BE64(pkg->hdr->pfs_image_offset);
 	pkg->pfs_image_size = BE64(pkg->hdr->pfs_image_size);
 	pkg->pfs_signed_size = BE32(pkg->hdr->pfs_signed_size);
+
+	if (file_count > 1 && pkg->map->size < pkg->pfs_image_offset + pkg->pfs_image_size) {
+		warning("pkg_alloc: split PKG is incomplete: %zu pieces with %" PRIu64 " bytes, need %" PRIu64 " bytes",
+		        file_count, pkg->map->size, pkg->pfs_image_offset + pkg->pfs_image_size);
+		goto error;
+	}
 
 	pkg->pfs_offset = 0;
 	pkg->inner_pfs_offset = 0;
@@ -1213,15 +1305,6 @@ struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_opti
 	}
 
 done:
-	if (file_paths) {
-		for (i = 0; i < file_count; ++i) {
-			if (file_paths[i])
-				free(file_paths[i]);
-		}
-
-		free(file_paths);
-	}
-
 	return pkg;
 
 error:
@@ -1242,15 +1325,6 @@ error:
 			free(pkg->hdr);
 
 		free(pkg);
-	}
-
-	if (file_paths) {
-		for (i = 0; i < file_count; ++i) {
-			if (file_paths[i])
-				free(file_paths[i]);
-		}
-
-		free(file_paths);
 	}
 
 	return NULL;
@@ -1370,16 +1444,15 @@ uint8_t* pkg_locate_entry_data(struct pkg* pkg, enum pkg_entry_id id, uint64_t* 
 	if (!entry)
 		return NULL;
 
-	if (pkg->map->use_pread) {
-		/*
-		 * pread-mode: entry data lives in the header region which was
-		 * already read into pkg->hdr (the malloc'd buffer).
-		 * Cast to uint8_t* and index from the start of that buffer.
-		 */
-		data = (uint8_t*)pkg->hdr + BE32(entry->offset);
-	} else {
-		data = pkg->map->data + BE32(entry->offset);
-	}
+	/* Entry data must lie inside what is actually buffered / mapped. */
+	if ((uint64_t)BE32(entry->offset) + BE32(entry->size) > pkg->hdr_size)
+		return NULL;
+
+	/*
+	 * In pread mode entry data lives in the metadata region that was read into
+	 * pkg->hdr; otherwise pkg->hdr is the start of the mapping.
+	 */
+	data = (uint8_t*)pkg->hdr + BE32(entry->offset);
 	if (offset)
 		*offset = BE32(entry->offset);
 	if (size)

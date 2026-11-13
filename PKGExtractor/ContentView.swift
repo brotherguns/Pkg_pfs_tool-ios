@@ -27,6 +27,9 @@ struct ContentView: View {
     // Per-PKG passcode / EKC prompt (shown when default keys fail)
     @State private var keyPromptPKG: URL? = nil
 
+    // Bumped on every refresh so rows re-read their file size / split state
+    @State private var refreshCount = 0
+
     var body: some View {
         NavigationView {
             VStack(spacing: 0) {
@@ -43,6 +46,12 @@ struct ContentView: View {
 
                     Text("Copy .pkg files into this app's folder in Files,\nthen tap a file below to extract it.")
                         .font(.subheadline)
+                        .foregroundColor(.secondary)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal)
+
+                    Text("Split PKG: copy every part (name_0.pkg, name_1.pkg, …) and tap the first one.")
+                        .font(.caption2)
                         .foregroundColor(.secondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal)
@@ -74,7 +83,7 @@ struct ContentView: View {
                     Spacer()
                 } else {
                     List(pkgFiles, id: \.path) { url in
-                        PKGRow(url: url, isSelected: selectedPKG == url, manager: manager) {
+                        PKGRow(url: url, isSelected: selectedPKG == url, manager: manager, refreshToken: refreshCount) {
                             beginFilePicking(url: url)
                         }
                     }
@@ -147,7 +156,10 @@ struct ContentView: View {
             }
             // Listing failed to decrypt -> close the picker and ask for keys for this PKG
             .onChange(of: manager.listError) { err in
-                guard err != nil, let pkg = pickerPKG, showFilePicker else { return }
+                // A split PKG with missing parts is not a key problem: leave the
+                // picker open so it shows which part is missing.
+                guard let err = err, !PKGSplit.isIncompleteError(err),
+                      let pkg = pickerPKG, showFilePicker else { return }
                 showFilePicker = false
                 pickerPKG      = nil
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
@@ -286,9 +298,16 @@ struct ContentView: View {
             includingPropertiesForKeys: [.fileSizeKey, .contentModificationDateKey],
             options: .skipsHiddenFiles
         )) ?? []
-        pkgFiles = contents
-            .filter { $0.pathExtension.lowercased() == "pkg" }
+        let all   = contents.filter { $0.pathExtension.lowercased() == "pkg" }
+        let names = Set(all.map { $0.lastPathComponent })
+        // Parts 1..N of a split PKG are shown under part 0, not as separate rows.
+        // The name alone is not enough: two unrelated whole PKGs called name_0.pkg and
+        // name_1.pkg must both stay visible, so the file has to be part of a real split set.
+        pkgFiles = all
+            .filter { !(PKGSplit.isContinuationPart($0.lastPathComponent, among: names)
+                        && PKGSplit.info(for: $0) != nil) }
             .sorted { $0.lastPathComponent < $1.lastPathComponent }
+        refreshCount += 1
     }
 
     /// Tap handler: start listing files then show the picker sheet.
@@ -386,9 +405,27 @@ struct PKGRow: View {
     let url:        URL
     let isSelected: Bool
     let manager:    ExtractionManager
+    let refreshToken: Int
     let onTap:      () -> Void
 
     @State private var fileSize = ""
+    @State private var split: PKGSplit.Info? = nil
+
+    private var subtitle: String {
+        guard let split = split else { return fileSize }
+        let total = ByteCountFormatter.string(fromByteCount: Int64(split.totalSize), countStyle: .file)
+        return split.isComplete
+            ? "\(split.parts) parts · \(total)"
+            : "\(split.parts) part\(split.parts == 1 ? "" : "s") found · incomplete (\(total))"
+    }
+
+    private func loadInfo() {
+        split = PKGSplit.info(for: url)
+        if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
+           let bytes = attrs.fileSize {
+            fileSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
+        }
+    }
 
     var body: some View {
         Button(action: onTap) {
@@ -402,9 +439,9 @@ struct PKGRow: View {
                         .font(.body)
                         .foregroundColor(.primary)
                         .lineLimit(1)
-                    Text(fileSize)
+                    Text(subtitle)
                         .font(.caption)
-                        .foregroundColor(.secondary)
+                        .foregroundColor(split?.isComplete == false ? .orange : .secondary)
                 }
 
                 Spacer()
@@ -420,12 +457,8 @@ struct PKGRow: View {
             .padding(.vertical, 4)
         }
         .disabled(manager.isExtracting || manager.isListing)
-        .onAppear {
-            if let attrs = try? url.resourceValues(forKeys: [.fileSizeKey]),
-               let bytes = attrs.fileSize {
-                fileSize = ByteCountFormatter.string(fromByteCount: Int64(bytes), countStyle: .file)
-            }
-        }
+        .onAppear(perform: loadInfo)
+        .onChange(of: refreshToken) { _ in loadInfo() }
     }
 }
 

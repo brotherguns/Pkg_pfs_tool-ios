@@ -17,9 +17,11 @@ struct file_map {
 	int write;
 	int submap;
 	/*
-	 * use_pread: set on __APPLE__ when the file is too large to mmap.
-	 * map->data is NULL; all reads go through map_pread() / map_pwrite().
-	 * Only valid for single-file, read-only maps (PKG input files).
+	 * use_pread: set on __APPLE__ when the file is too large to mmap, and
+	 * always for multi-file (split PKG) maps there.
+	 * map->data is NULL; all reads go through map_pread() / map_pwrite(),
+	 * which address the files as one contiguous range.
+	 * Only valid for read-only maps (PKG input files).
 	 */
 	int use_pread;
 };

@@ -782,6 +782,25 @@ struct pkg {
 	 * pkg_free() must free(pkg->hdr) when this is set.
 	 */
 	int hdr_owned;
+	/*
+	 * hdr_size: number of valid bytes at hdr.  In pread mode this is the whole
+	 * metadata region in front of the PFS image (header, entry table, entry
+	 * data); the entry table and entry data are addressed relative to hdr and
+	 * must stay inside it.  In mmap mode it is the mapped size.
+	 */
+	uint64_t hdr_size;
+};
+
+/*
+ * A PKG stored as several files that are the plain byte-wise pieces of one
+ * package (name_0.pkg, name_1.pkg, ...).  Piece 0 carries the header.
+ */
+struct pkg_piece_set {
+	char** paths;            /* existing pieces, in order, contiguous from index 0 */
+	size_t count;
+	uint64_t total_size;     /* sum of the sizes of paths[] */
+	uint64_t required_size;  /* pfs_image_offset + pfs_image_size from piece 0's header */
+	int complete;            /* total_size >= required_size */
 };
 
 struct pkg_entry_desc {
@@ -806,8 +825,19 @@ typedef int (*pkg_set_pfs_options_cb)(void* arg, struct pkg* pkg, struct pfs_opt
 
 typedef enum cb_result (*pkg_enum_entries_cb)(void* arg, struct pkg* pkg, struct pkg_entry_desc* desc);
 
+/* file_path may be a pattern with a '%' standing for the piece number (name_%.pkg). */
 struct pkg* pkg_alloc(const char* file_path, pkg_set_pfs_options_cb set_pfs_options_cb, void* set_pfs_options_cb_arg);
+struct pkg* pkg_alloc_pieces(const char* const* file_paths, size_t file_count, pkg_set_pfs_options_cb set_pfs_options_cb, void* set_pfs_options_cb_arg);
 void pkg_free(struct pkg* pkg);
+
+/*
+ * Locates the pieces "<prefix><n><suffix>" (n = 0, 1, ...; zero padded to `width` digits
+ * when width > 0).  Pieces are taken in order until their sizes cover the package as the
+ * header of piece 0 describes it.  Returns 0 if piece 0 is missing or is not a PKG.
+ * On success the caller releases `set` with pkg_free_piece_set(), also when !set->complete.
+ */
+int pkg_find_pieces(const char* prefix, const char* suffix, unsigned int width, struct pkg_piece_set* set);
+void pkg_free_piece_set(struct pkg_piece_set* set);
 
 int pkg_get_name_by_id(char* name, size_t max_size, enum pkg_entry_id id, int* is_extra);
 

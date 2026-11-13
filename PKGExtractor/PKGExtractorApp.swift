@@ -25,6 +25,9 @@ PKG Extractor
 Drop your .pkg files into this folder using the Files app,
 then open PKG Extractor and tap the file to extract it.
 
+Split PKGs (name_0.pkg, name_1.pkg, ...): copy ALL parts into
+this folder, then tap the first part (name_0.pkg).
+
 Output lands in:  PKGExtractor → Extracted → <pkg-name> → Image0
 
 Crash logs (if any) are written to: PKGExtractor → crash_log.txt

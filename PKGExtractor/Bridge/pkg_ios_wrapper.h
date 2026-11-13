@@ -114,6 +114,25 @@ int pkg_ios_list_files_ex(
     void*             cb_ctx
 );
 
+/**
+ * Describe how a PKG path will be opened.
+ *
+ * A split PKG is stored as name_0.pkg, name_1.pkg, ...  Passing the path of any
+ * part to the list / extract functions above opens the whole set; no other
+ * call is needed.  Use this to show the set in a UI.
+ *
+ * @param pkg_path        path of any part (or of a normal PKG)
+ * @param out_parts       number of parts found (1 for a normal PKG); may be NULL
+ * @param out_total_size  combined size of the parts found, 0 for a normal PKG; may be NULL
+ * @param out_complete    0 if parts are missing / truncated, else 1; may be NULL
+ *
+ * @return  1 if the path belongs to a split PKG, 0 otherwise.
+ *          An incomplete set makes the list / extract functions fail with an error
+ *          that starts with "Incomplete split PKG".
+ */
+int pkg_ios_split_info(const char* pkg_path, int* out_parts,
+                       uint64_t* out_total_size, int* out_complete);
+
 /** Read the content_id from the PKG header without decrypting.
  *  @return 1 on success, 0 on failure. */
 int pkg_ios_read_content_id(const char* pkg_path, char* out_buf, int buf_size);

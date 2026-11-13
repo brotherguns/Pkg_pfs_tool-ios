@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdarg.h>
 #include <pthread.h>
 #include <setjmp.h>
@@ -248,6 +249,91 @@ static int read_pkg_content_id(const char* pkg_path, char out_id[PKG_CONTENT_ID_
 }
 
 /* ------------------------------------------------------------------ */
+/* Split PKGs: name_0.pkg, name_1.pkg, ...                            */
+/*                                                                    */
+/* The parts are plain byte-wise pieces of one package; part 0 holds  */
+/* the header.  Any part's path resolves to the whole set.            */
+/* ------------------------------------------------------------------ */
+
+#define SPLIT_ERROR_PREFIX "Incomplete split PKG"   /* Swift matches on this */
+
+struct split_name {
+    char         prefix[4096];   /* path up to and including the '_'      */
+    char         suffix[16];     /* ".pkg" as spelled in the file name    */
+    unsigned int width;          /* digits to zero-pad to, 0 = unpadded   */
+    unsigned int index;          /* part number of the path that was given */
+};
+
+/* "<prefix>_<digits>.pkg" -> split_name.  Returns 1 on a match. */
+static int parse_split_name(const char* path, struct split_name* out) {
+    size_t len = strlen(path);
+    size_t dot, digits_end, digits_start, ndigits, i;
+    unsigned long long idx = 0;
+
+    if (len < 7 || len >= sizeof(out->prefix)) return 0;       /* "_0.pkg" */
+    dot = len - 4;
+    if (strcasecmp(path + dot, ".pkg") != 0) return 0;
+
+    digits_end = dot;
+    digits_start = digits_end;
+    while (digits_start > 0 && path[digits_start - 1] >= '0' && path[digits_start - 1] <= '9')
+        digits_start--;
+    ndigits = digits_end - digits_start;
+    if (ndigits == 0 || ndigits > 9 || digits_start == 0 || path[digits_start - 1] != '_') return 0;
+
+    for (i = digits_start; i < digits_end; i++) idx = idx * 10 + (unsigned)(path[i] - '0');
+
+    memcpy(out->prefix, path, digits_start);
+    out->prefix[digits_start] = '\0';
+    snprintf(out->suffix, sizeof(out->suffix), "%s", path + dot);
+    out->width = (ndigits > 1 && path[digits_start] == '0') ? (unsigned)ndigits : 0;
+    out->index = (unsigned)idx;
+    return 1;
+}
+
+static void split_piece_path(const struct split_name* n, unsigned int index, char* out, size_t out_size) {
+    snprintf(out, out_size, "%s%0*u%s", n->prefix, (int)n->width, index, n->suffix);
+}
+
+/*
+ * Resolves pkg_path to the pieces it is part of.
+ * Returns 1 if pkg_path belongs to a split PKG (set filled; set->complete says whether every
+ * part is there), 0 if it is a standalone PKG file (set left empty).  Release with
+ * pkg_free_piece_set().
+ */
+static int ios_resolve_pieces(const char* pkg_path, struct split_name* name, struct pkg_piece_set* set) {
+    memset(set, 0, sizeof(*set));
+    if (!parse_split_name(pkg_path, name)) return 0;
+    if (!pkg_find_pieces(name->prefix, name->suffix, name->width, set)) return 0;   /* no part 0 */
+
+    /* One file that already covers the whole package is just a PKG named "..._0.pkg". */
+    if (set->count == 1 && set->complete) {
+        pkg_free_piece_set(set);
+        return 0;
+    }
+    return 1;
+}
+
+static void set_incomplete_error(const struct split_name* name, const struct pkg_piece_set* set) {
+    char next[4096];
+    char errbuf[8192];
+    const char* base;
+
+    split_piece_path(name, (unsigned int)set->count, next, sizeof(next));
+    base = strrchr(next, '/');
+    base = base ? base + 1 : next;
+
+    snprintf(errbuf, sizeof(errbuf),
+             SPLIT_ERROR_PREFIX ".\n"
+             "Found %zu part(s) totaling %llu bytes, but the package needs %llu bytes.\n"
+             "Next expected part: %s\n"
+             "(or the last part that was copied is truncated).",
+             set->count, (unsigned long long)set->total_size,
+             (unsigned long long)set->required_size, base);
+    set_error(errbuf);
+}
+
+/* ------------------------------------------------------------------ */
 /* Shared PKG open / teardown helper                                  */
 /* ------------------------------------------------------------------ */
 
@@ -261,13 +347,37 @@ static int read_pkg_content_id(const char* pkg_path, char out_id[PKG_CONTENT_ID_
 static int pkg_open(const char* pkg_path, const char* config_path,
                     struct pkg** pkg_out) {
     char content_id[PKG_CONTENT_ID_MAX + 1] = { 0 };
-    if (!read_pkg_content_id(pkg_path, content_id)) {
-        char errbuf[512];
-        snprintf(errbuf, sizeof(errbuf),
-                 "Cannot open PKG or invalid magic.\nPath: %s\nErrno: %s",
-                 pkg_path, strerror(errno));
+    struct split_name  sname;
+    struct pkg_piece_set set;
+    const char* first_piece = pkg_path;
+    int is_split = ios_resolve_pieces(pkg_path, &sname, &set);
+
+    if (is_split) {
+        if (!set.complete) {
+            set_incomplete_error(&sname, &set);
+            append_warn_log_to_error();
+            pkg_free_piece_set(&set);
+            return -1;
+        }
+        first_piece = set.paths[0];
+        DIAG("Split PKG: %zu parts, %llu bytes", set.count, (unsigned long long)set.total_size);
+    }
+
+    if (!read_pkg_content_id(first_piece, content_id)) {
+        char errbuf[8192];
+        int n = snprintf(errbuf, sizeof(errbuf),
+                         "Cannot open PKG or invalid magic.\nPath: %s\nErrno: %s",
+                         first_piece, strerror(errno));
+        if (!is_split && parse_split_name(pkg_path, &sname) && sname.index > 0 && n > 0 && (size_t)n < sizeof(errbuf)) {
+            char part0[4096];
+            split_piece_path(&sname, 0, part0, sizeof(part0));
+            snprintf(errbuf + n, sizeof(errbuf) - (size_t)n,
+                     "\nThis looks like part %u of a split PKG, but part 0 was not found:\n%s",
+                     sname.index, part0);
+        }
         set_error(errbuf);
         append_warn_log_to_error();
+        pkg_free_piece_set(&set);
         return -1;
     }
     DIAG("PKG content_id = \"%s\"", content_id);
@@ -275,11 +385,13 @@ static int pkg_open(const char* pkg_path, const char* config_path,
     if (!crypto_initialize()) {
         set_error("crypto_initialize failed.");
         append_warn_log_to_error();
+        pkg_free_piece_set(&set);
         return -1;
     }
     if (!keymgr_initialize(config_path)) {
         set_error("keymgr_initialize failed.");
         append_warn_log_to_error();
+        pkg_free_piece_set(&set);
         crypto_finalize();
         return -1;
     }
@@ -297,7 +409,12 @@ static int pkg_open(const char* pkg_path, const char* config_path,
         }
     }
 
-    *pkg_out = pkg_alloc(pkg_path, ios_set_pfs_options, NULL);
+    if (is_split)
+        *pkg_out = pkg_alloc_pieces((const char* const*)set.paths, set.count, ios_set_pfs_options, NULL);
+    else
+        *pkg_out = pkg_alloc(pkg_path, ios_set_pfs_options, NULL);
+    pkg_free_piece_set(&set);
+
     if (!*pkg_out) {
         char errbuf[2048];
         snprintf(errbuf, sizeof(errbuf),
@@ -781,4 +898,29 @@ int pkg_ios_read_content_id(const char* pkg_path, char* out_buf, int buf_size) {
     strncpy(out_buf, tmp, (size_t)(buf_size - 1));
     out_buf[buf_size - 1] = '\0';
     return 1;
+}
+
+/* ------------------------------------------------------------------ */
+/* Split PKG description (for UI)                                     */
+/* ------------------------------------------------------------------ */
+
+int pkg_ios_split_info(const char* pkg_path, int* out_parts,
+                       uint64_t* out_total_size, int* out_complete) {
+    struct split_name    name;
+    struct pkg_piece_set set;
+    int is_split;
+
+    if (out_parts)      *out_parts = 1;
+    if (out_total_size) *out_total_size = 0;
+    if (out_complete)   *out_complete = 1;
+    if (!pkg_path) return 0;
+
+    is_split = ios_resolve_pieces(pkg_path, &name, &set);
+    if (is_split) {
+        if (out_parts)      *out_parts = (int)set.count;
+        if (out_total_size) *out_total_size = set.total_size;
+        if (out_complete)   *out_complete = set.complete;
+    }
+    pkg_free_piece_set(&set);
+    return is_split;
 }

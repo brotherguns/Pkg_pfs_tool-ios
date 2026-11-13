@@ -10,7 +10,16 @@
 #	include "mingw/mman.h"
 #endif
 
-#ifdef __APPLE__
+/*
+ * pread mode: inputs are read with pread() instead of being mmap'd.  Always the
+ * case for split (multi-file) inputs on Apple, where iOS refuses very large
+ * mappings.  PFS_MAP_FORCE_PREAD enables the same code on other hosts (tests).
+ */
+#if defined(__APPLE__) || defined(PFS_MAP_FORCE_PREAD)
+#	define MAP_HAVE_PREAD 1
+#endif
+
+#ifdef MAP_HAVE_PREAD
 #	include <unistd.h>  /* pread / pwrite */
 #endif
 
@@ -123,7 +132,7 @@ struct file_map* map_files(const char* const* file_paths, size_t file_count) {
 		if (data == MAP_FAILED) {
 			fprintf(stderr, "[DIAG] map_files: mmap() failed: errno=%d (%s)  size=%" PRIu64 "\n",
 			        errno, strerror(errno), file_size);
-#ifdef __APPLE__
+#ifdef MAP_HAVE_PREAD
 			/*
 			 * iOS refuses to mmap files larger than ~2 GB in a sideloaded app.
 			 * Fall back to a pread-mode map: data stays NULL, use_pread=1.
@@ -172,6 +181,50 @@ struct file_map* map_files(const char* const* file_paths, size_t file_count) {
 
 		return map;
 	}
+
+#ifdef MAP_HAVE_PREAD
+	/*
+	 * Split input: never mmap.  The reserve/unmap/MAP_FIXED trick below is racy
+	 * on iOS and the combined size is beyond what an iOS app may map.  Open every
+	 * piece and let map_pread() walk the segments.
+	 */
+	if (file_count > 1) {
+		for (i = 0; i < file_count; ++i) {
+			map->file_paths[i] = strdup(file_paths[i]);
+			if (!map->file_paths[i])
+				goto error;
+
+			fd = open(file_paths[i], O_RDONLY | O_LARGEFILE | O_BINARY);
+			if (fd < 0) {
+				fprintf(stderr, "[DIAG] map_files: open() failed: %s  errno=%d (%s)\n",
+				        file_paths[i], errno, strerror(errno));
+				goto error;
+			}
+
+			if (fstat64(fd, &st) < 0 || !S_ISREG(st.st_mode) ||
+			    (uint64_t)st.st_size != map->segments[i].size) {
+				fprintf(stderr, "[DIAG] map_files: piece %zu changed or not a regular file: %s\n",
+				        i, file_paths[i]);
+				errno = EINVAL;
+				goto error;
+			}
+
+			map->fds[i] = fd;
+			fd = -1;
+		}
+
+		fprintf(stderr, "[DIAG] map_files: split input, %zu pieces, total=%" PRIu64 " (pread mode)\n",
+		        file_count, total_file_size);
+
+		map->data      = NULL;
+		map->size      = total_file_size;
+		map->write     = 0;
+		map->submap    = 0;
+		map->use_pread = 1;
+
+		return map;
+	}
+#endif
 
 	/* Multi-file path: reserve contiguous address space, then MAP_FIXED each piece. */
 	file_size = total_file_size;
@@ -341,6 +394,7 @@ struct file_map* map_file_sub_region(struct file_map* map, uint64_t offset, uint
 	submap->offset = offset;
 	submap->write = map->write;
 	submap->submap = 1;
+	submap->use_pread = map->use_pread;
 
 	return submap;
 
@@ -391,68 +445,73 @@ void unmap_file(struct file_map* map) {
 	free(map);
 }
 
-#ifdef __APPLE__
+#ifdef MAP_HAVE_PREAD
 /*
  * map_pread / map_pwrite — used when map->use_pread == 1.
  *
- * Reads/writes exactly `n` bytes at absolute file offset `off`.
- * Returns 1 on success, 0 on any short read/write or error.
+ * Read/write exactly `n` bytes at absolute offset `off` of the (possibly
+ * multi-file) input.  A request may span several pieces; each piece is
+ * addressed through its own fd.  Returns 1 on success, 0 on error or when the
+ * range runs past the end of the last piece.
  */
-int map_pread(const struct file_map* map, void* buf, uint64_t n, uint64_t off) {
-	uint8_t* dst = (uint8_t*)buf;
-	uint64_t remaining = n;
-	off_t file_off = (off_t)(map->offset + off);
+static int map_rw(const struct file_map* map, void* buf, uint64_t n, uint64_t off, int write) {
+	uint8_t* p = (uint8_t*)buf;
+	uint64_t pos = map->offset + off;
+	uint64_t seg_start = 0;
+	size_t i;
 
 	assert(map != NULL);
 	assert(map->use_pread);
-	assert(map->fds != NULL && map->fds[0] >= 0);
+	assert(map->fds != NULL && map->segments != NULL);
 
-	while (remaining > 0) {
-		ssize_t got = pread(map->fds[0], dst, (size_t)remaining, file_off);
-		if (got <= 0) {
-			fprintf(stderr, "[DIAG] map_pread: pread failed: off=%" PRIu64 " n=%" PRIu64 " errno=%d (%s)\n",
-			        (uint64_t)file_off, n, errno, strerror(errno));
-			return 0;
+	for (i = 0; i < map->file_count && n > 0; ++i) {
+		uint64_t seg_end = seg_start + map->segments[i].size;
+
+		if (pos < seg_end) {
+			uint64_t chunk = MIN(n, seg_end - pos);
+			uint64_t seg_off = pos - seg_start;
+
+			while (chunk > 0) {
+				/* Darwin pread/pwrite reject counts above INT_MAX. */
+				size_t want = (size_t)MIN(chunk, (uint64_t)1 << 30);
+				ssize_t r = write ? pwrite(map->fds[i], p, want, (off_t)seg_off)
+				                  : pread(map->fds[i], p, want, (off_t)seg_off);
+				if (r <= 0) {
+					fprintf(stderr, "[DIAG] map_p%s: failed: piece=%zu off=%" PRIu64 " n=%zu errno=%d (%s)\n",
+					        write ? "write" : "read", i, seg_off, want, errno, strerror(errno));
+					return 0;
+				}
+				p += r;
+				pos += (uint64_t)r;
+				seg_off += (uint64_t)r;
+				chunk -= (uint64_t)r;
+				n -= (uint64_t)r;
+			}
 		}
-		dst      += got;
-		file_off += got;
-		remaining -= (uint64_t)got;
+
+		seg_start = seg_end;
 	}
-	return 1;
+
+	return n == 0;
+}
+
+int map_pread(const struct file_map* map, void* buf, uint64_t n, uint64_t off) {
+	return map_rw(map, buf, n, off, 0);
 }
 
 int map_pwrite(const struct file_map* map, const void* buf, uint64_t n, uint64_t off) {
-	const uint8_t* src = (const uint8_t*)buf;
-	uint64_t remaining = n;
-	off_t file_off = (off_t)(map->offset + off);
-
-	assert(map != NULL);
-	assert(map->use_pread);
-	assert(map->fds != NULL && map->fds[0] >= 0);
-
-	while (remaining > 0) {
-		ssize_t wrote = pwrite(map->fds[0], src, (size_t)remaining, file_off);
-		if (wrote <= 0) {
-			fprintf(stderr, "[DIAG] map_pwrite: pwrite failed: off=%" PRIu64 " n=%" PRIu64 " errno=%d (%s)\n",
-			        (uint64_t)file_off, n, errno, strerror(errno));
-			return 0;
-		}
-		src      += wrote;
-		file_off += wrote;
-		remaining -= (uint64_t)wrote;
-	}
-	return 1;
+	return map_rw(map, (void*)buf, n, off, 1);
 }
 #else
-/* Stub for non-Apple: use_pread is never set, these should never be called. */
+/* Stub for hosts without pread mode: use_pread is never set, these should never be called. */
 int map_pread(const struct file_map* map, void* buf, uint64_t n, uint64_t off) {
 	(void)map; (void)buf; (void)n; (void)off;
-	assert(0 && "map_pread called on non-Apple platform");
+	assert(0 && "map_pread called without pread mode");
 	return 0;
 }
 int map_pwrite(const struct file_map* map, const void* buf, uint64_t n, uint64_t off) {
 	(void)map; (void)buf; (void)n; (void)off;
-	assert(0 && "map_pwrite called on non-Apple platform");
+	assert(0 && "map_pwrite called without pread mode");
 	return 0;
 }
 #endif
